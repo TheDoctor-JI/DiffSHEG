@@ -112,27 +112,30 @@ class WaypointCollector:
             all_poses[last_frame_idx+1:] = all_poses[last_frame_idx]
             print(f"[EXPORT] Filled frames {last_frame_idx+1}-{total_audio_frames-1} with last waypoint pose")
         
-        # Split into gesture (141) and expression (51)
-        gestures = all_poses[:, :self.split_pos]      # (total_audio_frames, 141)
-        expressions = all_poses[:, self.split_pos:]   # (total_audio_frames, 51)
+        # === CRITICAL: Split FIRST, then denormalize separately ===
+        # Model outputs normalized data in concatenated space (192 dims)
+        # Following official code pattern: split normalized data, then denormalize each part separately
+        # This is KEY: zeros in gesture space should map to gesture mean, not combined mean!
         
-        print(f"[EXPORT] Split poses: gestures={gestures.shape}, expressions={expressions.shape}")
+        # Split into gesture (141) and expression (51) while still normalized
+        gestures_normalized = all_poses[:, :self.split_pos]      # (T, 141) - still normalized
+        expressions_normalized = all_poses[:, self.split_pos:]   # (T, 51) - still normalized
         
-        # === Gesture Processing ===
-        # Load normalization statistics for gestures
-        # These are the same stats used during training
+        print(f"[EXPORT] Split normalized poses: gestures={gestures_normalized.shape}, expressions={expressions_normalized.shape}")
+        
+        # Load normalization statistics (separate for gesture and expression)
         mean_pose_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_mean.npy"
         std_pose_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_std.npy"
         
-        mean_pose = torch.from_numpy(np.load(mean_pose_path)).float()
-        std_pose = torch.from_numpy(np.load(std_pose_path)).float()
+        mean_pose = torch.from_numpy(np.load(mean_pose_path)).float()  # (141,)
+        std_pose = torch.from_numpy(np.load(std_pose_path)).float()    # (141,)
         
-        # Convert gestures to BVH format (body motion)
-        # Gestures are in normalized space and need denormalization
-        gestures_tensor = torch.from_numpy(gestures).unsqueeze(0)  # (1, T, 141)
+        print(f"[EXPORT] Loaded gesture normalization stats: mean={mean_pose.shape}, std={std_pose.shape}")
         
-        # Denormalize using dataset statistics
-        denorm_gestures = gestures_tensor * std_pose + mean_pose
+        # === Gesture Processing ===
+        # Denormalize gestures using GESTURE-ONLY statistics
+        gestures_tensor = torch.from_numpy(gestures_normalized).unsqueeze(0)  # (1, T, 141)
+        denorm_gestures = gestures_tensor * std_pose + mean_pose  # Denormalize: (normalized * std) + mean
         denorm_gestures_np = denorm_gestures.squeeze(0).numpy()  # (T, 141)
         
         # Convert to degrees (gestures are in Euler angles)
@@ -152,8 +155,9 @@ class WaypointCollector:
         
         # === Expression Processing ===
         # Convert expressions to JSON format (facial blendshapes)
-        # Note: expressions are still in normalized space, write_face_json will denormalize them
-        expressions_expanded = np.expand_dims(expressions, 0)  # (1, T, 51)
+        # Note: write_face_json expects NORMALIZED data and will denormalize it internally
+        # expressions_normalized is already in normalized form (as split from model output)
+        expressions_expanded = np.expand_dims(expressions_normalized, 0)  # (1, T, 51)
         json_dir = os.path.join(output_dir, 'face_json')
         os.makedirs(json_dir, exist_ok=True)
         trainer.write_face_json(
