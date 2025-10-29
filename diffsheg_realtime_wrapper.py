@@ -168,6 +168,9 @@ class DiffSHEGRealtimeWrapper:
         self.current_utterance: Optional[Utterance] = None
         self.utterance_lock = threading.Lock()
         
+        # Track cancelled/timed-out utterances to reject late-arriving chunks
+        self.cancelled_utterances: set = set()  # Set of utterance_ids that have been cancelled or timed out
+        
         # Generation state
         self.last_generated_waypoint_index: int = -1  # Track which waypoint index was last generated
         
@@ -201,6 +204,18 @@ class DiffSHEGRealtimeWrapper:
         if self.generation_thread:
             self.generation_thread.join(timeout=2.0)
     
+    def reset_context(self):
+        """
+        Reset all state-related variables.
+        
+        This clears the current utterance, cancellation history, and generation state.
+        Useful for starting fresh or cleaning up after a session ends.
+        """
+        with self.utterance_lock:
+            self.current_utterance = None
+            self.cancelled_utterances.clear()
+            self.last_generated_waypoint_index = -1
+    
     def add_audio_chunk(self, utterance_id: int, chunk_index: int, audio_data: np.ndarray, 
                         duration: float, start_margin: Optional[float] = None):
         """
@@ -215,6 +230,11 @@ class DiffSHEGRealtimeWrapper:
             duration: Duration of the chunk in seconds
             start_margin: Optional start margin for this specific utterance. If None, uses default.
         """
+        # Reject chunks for cancelled/timed-out utterances
+        if utterance_id in self.cancelled_utterances:
+            # Silently ignore - this is expected for late-arriving chunks after cancellation
+            return
+    
         chunk = AudioChunk(
             utterance_id=utterance_id,
             chunk_index=chunk_index,
@@ -224,8 +244,17 @@ class DiffSHEGRealtimeWrapper:
         )
         
         with self.utterance_lock:
+            # Double-check after acquiring lock (in case it was cancelled while we were creating the chunk)
+            if utterance_id in self.cancelled_utterances:
+                return
+            
             # If this is a new utterance, discard the old one
             if self.current_utterance is None or self.current_utterance.utterance_id != utterance_id:
+                # Mark old utterance as cancelled if it exists
+                if self.current_utterance is not None:
+                    old_utterance_id = self.current_utterance.utterance_id
+                    self.cancelled_utterances.add(old_utterance_id)
+                
                 margin = start_margin if start_margin is not None else self.default_start_margin
                 self.current_utterance = Utterance(
                     utterance_id=utterance_id,
@@ -256,10 +285,17 @@ class DiffSHEGRealtimeWrapper:
         discard the current utterance and all its waypoints when cancelled.
         The system will start fresh with the next utterance.
         
+        This also prevents late-arriving chunks for this utterance from being
+        processed by tracking cancelled utterance IDs in a set.
+        
         Args:
             utterance_id: The utterance to cancel (msg_idx in your system)
         """
         with self.utterance_lock:
+            # Add to cancelled set to reject any late-arriving chunks
+            self.cancelled_utterances.add(utterance_id)
+            
+            # If this is the current utterance, discard it
             if self.current_utterance and self.current_utterance.utterance_id == utterance_id:
                 # Simply discard everything - generation is faster than realtime
                 # so we can regenerate from scratch for the next utterance
@@ -518,25 +554,17 @@ class DiffSHEGRealtimeWrapper:
             if utterance.gesture_waypoints is not None:
                 utterance.gesture_waypoints.add_waypoints(waypoints)
     
-    def get_current_waypoints(self) -> Optional[List[GestureWaypoint]]:
-        """
-        Get all generated waypoints for the current utterance.
-        
-        Returns:
-            List of GestureWaypoint objects, or None if no waypoints available
-        """
-        with self.utterance_lock:
-            if self.current_utterance is None or self.current_utterance.gesture_waypoints is None:
-                return None
-            with self.current_utterance.gesture_waypoints.lock:
-                return list(self.current_utterance.gesture_waypoints.waypoints)
-    
     def _cleanup_current_utterance(self):
         """
         Internal cleanup method called automatically by playback managing thread.
         Cleans up current utterance data after playback naturally ends.
+        Also marks the utterance as cancelled to reject any late-arriving chunks.
         """
         with self.utterance_lock:
+            if self.current_utterance is not None:
+                # Mark as cancelled to reject late chunks
+                self.cancelled_utterances.add(self.current_utterance.utterance_id)
+    
             self.current_utterance = None
             self.last_generated_waypoint_index = -1
 
