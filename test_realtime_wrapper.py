@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import librosa
 from pathlib import Path
+import shutil
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -17,6 +18,150 @@ from options.train_options import TrainCompOptions
 from models import MotionTransformer, UniDiffuser
 from trainers import DDPMTrainer_beat
 from diffsheg_realtime_wrapper import DiffSHEGRealtimeWrapper
+import datasets.rotation_converter as rot_cvt
+
+
+class WaypointCollector:
+    """
+    Collects waypoints during realtime generation and exports them to BVH+JSON format.
+    
+    Handles timing alignment: waypoints have timestamps relative to audio start,
+    but gesture generation may not cover the entire audio duration (due to start_margin).
+    """
+    
+    def __init__(self, split_pos=141, gesture_fps=15):
+        self.waypoints = []
+        self.split_pos = split_pos  # Split position between gesture and expression
+        self.gesture_fps = gesture_fps
+        self.first_timestamp = None  # Track when gestures actually start
+        self.last_timestamp = None   # Track when gestures actually end
+    
+    def collect(self, waypoint):
+        """Store each waypoint as it arrives"""
+        self.waypoints.append({
+            'index': waypoint.waypoint_index,
+            'timestamp': waypoint.timestamp,  # Time in seconds from utterance start
+            'gesture_data': waypoint.gesture_data.copy()  # shape (192,)
+        })
+        
+        # Track timing bounds
+        if self.first_timestamp is None:
+            self.first_timestamp = waypoint.timestamp
+        self.last_timestamp = waypoint.timestamp
+        
+        print(f"[WAYPOINT] Collected waypoint {waypoint.waypoint_index} at t={waypoint.timestamp:.3f}s - shape: {waypoint.gesture_data.shape}")
+    
+    def save_to_files(self, output_dir, trainer, audio_duration):
+        """
+        Convert collected waypoints to BVH + JSON format for Blender visualization.
+        
+        Handles timing alignment:
+        - Waypoints have timestamps relative to audio start
+        - May not cover entire audio duration (start_margin delay)
+        - Fills missing frames with neutral/zero poses
+        
+        Args:
+            output_dir: Directory to save output files
+            trainer: DDPMTrainer_beat instance with conversion methods and normalization stats
+            audio_duration: Total duration of audio in seconds
+        """
+        if len(self.waypoints) == 0:
+            print("[EXPORT] No waypoints collected!")
+            return
+        
+        print(f"\n[EXPORT] Processing {len(self.waypoints)} waypoints...")
+        print(f"[EXPORT] Waypoint timing: first={self.first_timestamp:.3f}s, last={self.last_timestamp:.3f}s")
+        print(f"[EXPORT] Audio duration: {audio_duration:.3f}s")
+        
+        # Sort waypoints by index to ensure correct order
+        self.waypoints.sort(key=lambda x: x['index'])
+        
+        # Calculate total frames needed to cover the entire audio
+        total_audio_frames = int(np.ceil(audio_duration * self.gesture_fps))
+        
+        # Create frame array for entire audio duration, initialized with zeros
+        # This will be filled with actual waypoint data where available
+        all_poses = np.zeros((total_audio_frames, 192), dtype=np.float32)
+        
+        # Fill in the waypoint data at appropriate frame indices
+        for waypoint in self.waypoints:
+            # Convert timestamp to frame index
+            frame_idx = int(np.round(waypoint['timestamp'] * self.gesture_fps))
+            
+            # Ensure we don't exceed array bounds
+            if 0 <= frame_idx < total_audio_frames:
+                all_poses[frame_idx] = waypoint['gesture_data']
+        
+        # For frames without waypoints (before first waypoint or after last),
+        # we can either leave them as zero or copy the nearest valid frame
+        # Let's use forward-fill and backward-fill strategy
+        first_frame_idx = int(np.round(self.first_timestamp * self.gesture_fps))
+        last_frame_idx = int(np.round(self.last_timestamp * self.gesture_fps))
+        
+        # Forward fill: copy first valid frame to all frames before it
+        if first_frame_idx > 0:
+            all_poses[:first_frame_idx] = all_poses[first_frame_idx]
+            print(f"[EXPORT] Filled frames 0-{first_frame_idx-1} with first waypoint pose")
+        
+        # Backward fill: copy last valid frame to all frames after it
+        if last_frame_idx < total_audio_frames - 1:
+            all_poses[last_frame_idx+1:] = all_poses[last_frame_idx]
+            print(f"[EXPORT] Filled frames {last_frame_idx+1}-{total_audio_frames-1} with last waypoint pose")
+        
+        # Split into gesture (141) and expression (51)
+        gestures = all_poses[:, :self.split_pos]      # (total_audio_frames, 141)
+        expressions = all_poses[:, self.split_pos:]   # (total_audio_frames, 51)
+        
+        print(f"[EXPORT] Split poses: gestures={gestures.shape}, expressions={expressions.shape}")
+        
+        # Load normalization statistics for gestures
+        # These are the same stats used during training
+        mean_pose_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_mean.npy"
+        std_pose_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_std.npy"
+        
+        mean_pose = torch.from_numpy(np.load(mean_pose_path)).float()
+        std_pose = torch.from_numpy(np.load(std_pose_path)).float()
+        
+        # Convert gestures to BVH format (body motion)
+        # Gestures are in normalized space and need denormalization
+        gestures_tensor = torch.from_numpy(gestures).unsqueeze(0)  # (1, T, 141)
+        
+        # Denormalize using dataset statistics
+        denorm_gestures = gestures_tensor * std_pose + mean_pose
+        denorm_gestures_np = denorm_gestures.squeeze(0).numpy()  # (T, 141)
+        
+        # Convert to degrees (gestures are in Euler angles)
+        denorm_gestures_np = denorm_gestures_np * (180 / np.pi)
+        
+        print(f"[EXPORT] Denormalized gestures: shape={denorm_gestures_np.shape}")
+        
+        # Save BVH file
+        bvh_dir = os.path.join(output_dir, 'bvh')
+        os.makedirs(bvh_dir, exist_ok=True)
+        trainer.result2target_vis(
+            denorm_gestures_np, 
+            bvh_dir, 
+            'realtime_output.bvh'
+        )
+        print(f"[EXPORT] Saved BVH to {bvh_dir}/realtime_output.bvh")
+        
+        # Convert expressions to JSON format (facial blendshapes)
+        expressions_expanded = np.expand_dims(expressions, 0)  # (1, T, 51)
+        json_dir = os.path.join(output_dir, 'face_json')
+        os.makedirs(json_dir, exist_ok=True)
+        trainer.write_face_json(
+            expressions_expanded, 
+            os.path.join(json_dir, 'realtime_output.json')
+        )
+        print(f"[EXPORT] Saved JSON to {json_dir}/realtime_output.json")
+        
+        print(f"\n[EXPORT] Export complete!")
+        print(f"[EXPORT] Total frames: {total_audio_frames} ({audio_duration:.2f}s @ {self.gesture_fps} FPS)")
+        print(f"[EXPORT] Waypoint coverage: frames {first_frame_idx}-{last_frame_idx}")
+
+
+# Global waypoint collector
+waypoint_collector = None
 
 
 def waypoint_handler(waypoint):
@@ -26,7 +171,8 @@ def waypoint_handler(waypoint):
     Args:
         waypoint: GestureWaypoint object containing waypoint information
     """
-    print(f"[WAYPOINT] Received waypoint {waypoint.waypoint_index} at timestamp {waypoint.timestamp:.3f}s - gesture_data shape: {waypoint.gesture_data.shape}")
+    if waypoint_collector is not None:
+        waypoint_collector.collect(waypoint)
 
 
 def build_model(opt):
@@ -149,6 +295,8 @@ def audio_to_chunks(audio, sr, chunk_duration=0.04):
 
 
 def main():
+    global waypoint_collector
+    
     # Parse arguments (mimicking the bash script)
     parser = TrainCompOptions()
     
@@ -179,9 +327,16 @@ def main():
     model = build_model(opt)
     model = model.to(opt.device)
     
-    # Initialize trainer (which handles model loading)
+    # Initialize trainer (which handles model loading and normalization stats)
     print("Initializing trainer...")
     trainer = DDPMTrainer_beat(opt, model, eval_model=None)
+    
+    # Initialize waypoint collector
+    print("Initializing waypoint collector...")
+    waypoint_collector = WaypointCollector(
+        split_pos=opt.split_pos,  # 141 for gesture/expression split
+        gesture_fps=15  # BEAT dataset uses 15 FPS
+    )
     
     # Initialize wrapper
     print("Initializing realtime wrapper...")
@@ -249,6 +404,36 @@ def main():
     # Stop wrapper
     print("\nStopping wrapper...")
     wrapper.stop()
+    
+    # Export waypoints to visualization format
+    print("\n" + "="*60)
+    print("Exporting waypoints to visualization format...")
+    print("="*60)
+    
+    output_dir = 'results/realtime_test'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    waypoint_collector.save_to_files(
+        output_dir=output_dir,
+        trainer=trainer,
+        audio_duration=audio_duration
+    )
+    
+    # Copy audio file to output directory for convenience
+    audio_output_path = os.path.join(output_dir, os.path.basename(audio_path))
+    shutil.copy(audio_path, audio_output_path)
+    print(f"[EXPORT] Copied audio to {audio_output_path}")
+    
+    print("\n" + "="*60)
+    print("Next Steps for Blender Visualization:")
+    print("="*60)
+    print("1. Open assets/beat_visualize.blend in Blender")
+    print("2. Set paths in the Blender script:")
+    print(f"   - BVH: {os.path.abspath(os.path.join(output_dir, 'bvh', 'realtime_output.bvh'))}")
+    print(f"   - JSON: {os.path.abspath(os.path.join(output_dir, 'face_json', 'realtime_output.json'))}")
+    print(f"   - Audio: {os.path.abspath(audio_output_path)}")
+    print("3. Run the script in Blender to render video")
+    print("="*60)
     
     print("\nTest complete!")
 
