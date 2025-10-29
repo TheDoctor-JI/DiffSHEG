@@ -333,7 +333,7 @@ class DDPMTrainer_beat(object):
     
 
     def one_hot(self, ids, dim):
-        ones_eye = torch.eye(dim)
+        ones_eye = torch.eye(dim, device=ids.device)
         return (ones_eye[ids.long()].squeeze())
     
 

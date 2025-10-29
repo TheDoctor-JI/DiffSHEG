@@ -229,6 +229,21 @@ class DiffSHEGRealtimeWrapper:
         self.logger.info("DiffSHEG Realtime Wrapper initialized")
         self.logger.info(f"Configuration: sample_rate={audio_sr}, device={device}, start_margin={default_start_margin}s")
         
+        # Check if HuBERT features are needed
+        self.use_hubert = getattr(opt, 'addHubert', False) or getattr(opt, 'expAddHubert', False)
+        if self.use_hubert:
+            self.logger.info("HuBERT features enabled - loading models...")
+            from transformers import Wav2Vec2Processor, HubertModel
+            self.wav2vec2_processor = Wav2Vec2Processor.from_pretrained("facebook/hubert-large-ls960-ft")
+            self.hubert_model = HubertModel.from_pretrained("facebook/hubert-large-ls960-ft")
+            self.hubert_model = self.hubert_model.to(device)
+            self.hubert_model.eval()
+            self.logger.info("HuBERT models loaded successfully")
+        else:
+            self.wav2vec2_processor = None
+            self.hubert_model = None
+            self.logger.info("HuBERT features disabled")
+        
         # Current utterance tracking (only keep the latest)
         self.current_utterance: Optional[Utterance] = None
         self.utterance_lock = threading.Lock()
@@ -600,6 +615,67 @@ class DiffSHEGRealtimeWrapper:
                     self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{utterance.next_window_start_sample}-{utterance.next_window_end_sample}] (step={utterance.next_window_start_sample - (prev_window_end - (utterance.next_window_end_sample - utterance.next_window_start_sample))} samples)")
 
     
+    def _get_hubert_from_16k_speech(self, speech_tensor):
+        """
+        Extract HuBERT features from 16kHz audio.
+        
+        Args:
+            speech_tensor: Audio tensor of shape [1, T] at 16kHz
+            
+        Returns:
+            HuBERT features of shape [T_hubert, 1024]
+        """
+        with torch.no_grad():
+            # Process audio through Wav2Vec2 processor
+            input_values_all = self.wav2vec2_processor(
+                speech_tensor.cpu().numpy().squeeze(0),
+                return_tensors="pt",
+                sampling_rate=16000
+            ).input_values.squeeze(0)
+            input_values_all = input_values_all.to(self.device)
+            
+            # For long audio, process in chunks to avoid memory issues
+            # HuBERT uses CNN with stride 320 and kernel 400
+            kernel = 400
+            stride = 320
+            clip_length = stride * 1000
+            num_iter = input_values_all.shape[1] // clip_length
+            expected_T = (input_values_all.shape[1] - (kernel - stride)) // stride
+            
+            res_lst = []
+            for i in range(num_iter):
+                if i == 0:
+                    start_idx = 0
+                    end_idx = clip_length - stride + kernel
+                else:
+                    start_idx = clip_length * i
+                    end_idx = start_idx + (clip_length - stride + kernel)
+                
+                input_values = input_values_all[:, start_idx:end_idx]
+                hidden_states = self.hubert_model(input_values).last_hidden_state
+                res_lst.append(hidden_states[0])
+            
+            # Process remaining audio
+            if num_iter > 0:
+                input_values = input_values_all[:, clip_length * num_iter:]
+            else:
+                input_values = input_values_all
+            
+            if input_values.shape[1] >= kernel:
+                hidden_states = self.hubert_model(input_values).last_hidden_state
+                res_lst.append(hidden_states[0])
+            
+            ret = torch.cat(res_lst, dim=0)  # [T, 1024]
+            
+            # Pad or trim to expected length
+            if ret.shape[0] < expected_T:
+                ret = torch.nn.functional.pad(ret, (0, 0, 0, expected_T - ret.shape[0]))
+            else:
+                ret = ret[:expected_T]
+            
+            return ret
+
+    
     def _generate_gesture_window_from_audio(
         self, 
         audio_bytes: bytes,
@@ -657,14 +733,15 @@ class DiffSHEGRealtimeWrapper:
         audio_window = audio_emb
         
         # Pad or trim to window size
-        if audio_window.shape[1] < self.window_size:
-            padding = self.window_size - audio_window.shape[1]
+        target_frames = self.window_size
+        if audio_window.shape[1] < target_frames:
+            padding = target_frames - audio_window.shape[1]
             audio_window = torch.cat([
                 audio_window,
                 torch.zeros(1, padding, audio_window.shape[2], device=self.device)
             ], dim=1)
-        elif audio_window.shape[1] > self.window_size:
-            audio_window = audio_window[:, :self.window_size, :]
+        elif audio_window.shape[1] > target_frames:
+            audio_window = audio_window[:, :target_frames, :]
         
         # Prepare inputs for DiffSHEG
         B, T, _ = audio_window.shape
@@ -676,7 +753,36 @@ class DiffSHEGRealtimeWrapper:
         p_id = self.model.one_hot(p_id, self.opt.speaker_dim).to(self.device)
         
         # Additional conditioning (e.g., HuBERT features)
+        # Note: For models trained with HuBERT features, these should be extracted
+        # from the audio. For now, we pass an empty dict if not using HuBERT,
+        # or you can add HuBERT extraction here if needed.
         add_cond = {}
+        
+        # Extract HuBERT features if needed
+        if self.use_hubert and self.hubert_model is not None:
+            # Need to extract HuBERT from the full 16kHz audio (not resampled)
+            # HuBERT expects 16kHz audio
+            audio_16k_tensor = torch.from_numpy(audio_float).unsqueeze(0).to(self.device)
+            hubert_feat = self._get_hubert_from_16k_speech(audio_16k_tensor)
+            
+            # Interpolate HuBERT features to match the mel spectrogram frames
+            # Following the official script's exact interpolation method:
+            # HuBERT output: [T_hubert, 1024], audio_window: [1, T_mel, 128]
+            import torch.nn.functional as F
+            # Swap axes and add batch dimension: [T_hubert, 1024] -> [1, 1024, T_hubert]
+            hubert_feat = hubert_feat.swapaxes(-1, -2).unsqueeze(0)
+            # Interpolate to match mel frames: [1, 1024, T_hubert] -> [1, 1024, T_mel]
+            hubert_feat = F.interpolate(
+                hubert_feat,
+                size=audio_window.shape[1],  # Match T_mel (audio_emb.shape[-2] in official script)
+                mode='linear',
+                align_corners=True
+            )
+            # Swap back: [1, 1024, T_mel] -> [1, T_mel, 1024]
+            hubert_feat = hubert_feat.swapaxes(-1, -2)
+            add_cond["pretrain_aud_feat"] = hubert_feat
+            
+            self.logger.debug(f"Utterance {utterance_id} HuBERT features extracted: shape={hubert_feat.shape}")
         
         # Inpainting for overlap - use overlap context from previous window for smooth transitions
         inpaint_dict = {}
