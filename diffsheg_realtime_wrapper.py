@@ -216,6 +216,10 @@ class DiffSHEGRealtimeWrapper:
             self.cancelled_utterances.clear()
             self.last_generated_waypoint_index = -1
     
+    '''
+    Utterance lifecycle methods
+    '''
+
     def add_audio_chunk(self, utterance_id: int, chunk_index: int, audio_data: np.ndarray, 
                         duration: float, start_margin: Optional[float] = None):
         """
@@ -302,6 +306,24 @@ class DiffSHEGRealtimeWrapper:
                 self.current_utterance = None
                 self.last_generated_waypoint_index = -1
     
+    def _cleanup_current_utterance(self):
+        """
+        Internal cleanup method called automatically by playback managing thread.
+        Cleans up current utterance data after playback naturally ends.
+        Also marks the utterance as cancelled to reject any late-arriving chunks.
+        """
+        with self.utterance_lock:
+            if self.current_utterance is not None:
+                # Mark as cancelled to reject late chunks
+                self.cancelled_utterances.add(self.current_utterance.utterance_id)
+    
+            self.current_utterance = None
+            self.last_generated_waypoint_index = -1
+
+
+    '''
+    Track utterance playback and manage gesture playback
+    '''
     def _playback_managing_loop(self):
         """
         Thread 1: Playback Managing Thread
@@ -370,6 +392,11 @@ class DiffSHEGRealtimeWrapper:
             if sleep_time > 0:
                 time.sleep(sleep_time)
     
+
+    '''
+    Gesture generation scheduling
+    '''
+
     def _generation_loop(self):
         """
         Thread 2: Monitor available audio and schedule gesture generation.
@@ -554,20 +581,6 @@ class DiffSHEGRealtimeWrapper:
             if utterance.gesture_waypoints is not None:
                 utterance.gesture_waypoints.add_waypoints(waypoints)
     
-    def _cleanup_current_utterance(self):
-        """
-        Internal cleanup method called automatically by playback managing thread.
-        Cleans up current utterance data after playback naturally ends.
-        Also marks the utterance as cancelled to reject any late-arriving chunks.
-        """
-        with self.utterance_lock:
-            if self.current_utterance is not None:
-                # Mark as cancelled to reject late chunks
-                self.cancelled_utterances.add(self.current_utterance.utterance_id)
-    
-            self.current_utterance = None
-            self.last_generated_waypoint_index = -1
-
 
 # Example usage
 if __name__ == "__main__":
