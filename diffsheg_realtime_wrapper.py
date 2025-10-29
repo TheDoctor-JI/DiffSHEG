@@ -304,6 +304,41 @@ class DiffSHEGRealtimeWrapper:
         self.gesture_fps = 15
         
         self.logger.info(f"DiffSHEG parameters: window_size={self.window_size}, overlap={self.overlap_len}, step={self.window_step}, fps={self.gesture_fps}")
+
+        # Audio feature extraction parameters (match official DiffSHEG preprocessing)
+        self.mel_sample_rate = 18000
+        self.mel_hop_length = 1200
+        self.mel_num_mels = 128
+        mel_frame_rate = self.mel_sample_rate / self.mel_hop_length
+        if abs(mel_frame_rate - self.gesture_fps) > 1e-3:
+            self.logger.warning(
+                f"Mel frame rate {mel_frame_rate:.3f} does not match gesture FPS {self.gesture_fps}; check configuration."
+            )
+
+        # Optional audio normalization stats (rarely enabled for BEAT)
+        self.audio_norm_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        if getattr(self.opt, "audio_norm", False):
+            cache_root = os.path.join(
+                "data",
+                "BEAT",
+                "beat_cache",
+                getattr(self.opt, "beat_cache_name", ""),
+                "train",
+                getattr(self.opt, "audio_rep", "wave16k"),
+            )
+            mean_path = os.path.join(cache_root, "npy_mean.npy")
+            std_path = os.path.join(cache_root, "npy_std.npy")
+            if os.path.exists(mean_path) and os.path.exists(std_path):
+                self.audio_norm_stats = (
+                    np.load(mean_path).astype(np.float32),
+                    np.load(std_path).astype(np.float32),
+                )
+                self.logger.info(f"Loaded audio normalization stats from {cache_root}")
+            else:
+                self.logger.warning(
+                    f"Audio normalization enabled but stats not found under {cache_root}; continuing without normalization."
+                )
+                self.audio_norm_stats = None
         
     def start(self):
         """Start the wrapper threads."""
@@ -721,6 +756,67 @@ class DiffSHEGRealtimeWrapper:
             
             return ret
 
+    def _compute_full_audio_features(
+        self,
+        audio_float: np.ndarray,
+        sample_rate: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Compute mel and optional HuBERT features for the full audio context."""
+        if audio_float.size == 0:
+            return None, None
+
+        raw_audio = np.asarray(audio_float, dtype=np.float32)
+        audio_proc = raw_audio.copy()
+
+        if self.audio_norm_stats is not None:
+            mean_audio, std_audio = self.audio_norm_stats
+            if mean_audio.size == 0 or std_audio.size == 0:
+                self.logger.warning("Audio normalization stats empty; skipping normalization.")
+            else:
+                repeats = int(np.ceil(audio_proc.size / mean_audio.size))
+                mean_tiled = np.tile(mean_audio, repeats)[:audio_proc.size]
+                std_tiled = np.tile(std_audio, repeats)[:audio_proc.size]
+                std_tiled = np.clip(std_tiled, 1e-6, None)
+                audio_proc = (audio_proc - mean_tiled) / std_tiled
+
+        try:
+            audio_18k = librosa.resample(audio_proc, orig_sr=sample_rate, target_sr=self.mel_sample_rate)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self.logger.error(f"Failed to resample audio to {self.mel_sample_rate} Hz: {exc}")
+            return None, None
+
+        mel_full = librosa.feature.melspectrogram(
+            y=audio_18k,
+            sr=self.mel_sample_rate,
+            hop_length=self.mel_hop_length,
+            n_mels=self.mel_num_mels,
+        )
+        mel_full = mel_full.astype(np.float32, copy=False)
+        if mel_full.shape[1] > 1:
+            mel_full = mel_full[:, :-1]
+        if mel_full.shape[1] == 0:
+            self.logger.debug("Mel spectrogram empty after trimming; inserting a zero frame.")
+            mel_full = np.zeros((self.mel_num_mels, 1), dtype=np.float32)
+
+        mel_swapped = np.swapaxes(mel_full, -1, -2)
+        mel_swapped = np.ascontiguousarray(mel_swapped, dtype=np.float32)
+        audio_emb_full = torch.from_numpy(mel_swapped).unsqueeze(0).to(self.device)
+
+        hubert_feat_full: Optional[torch.Tensor] = None
+        if self.use_hubert and self.hubert_model is not None:
+            audio_16k = torch.from_numpy(raw_audio).unsqueeze(0).to(self.device)
+            hubert_feat_full = self._get_hubert_from_16k_speech(audio_16k)
+            hubert_feat_full = hubert_feat_full.swapaxes(-1, -2).unsqueeze(0)
+            hubert_feat_full = F.interpolate(
+                hubert_feat_full,
+                size=audio_emb_full.shape[1],
+                mode="linear",
+                align_corners=True,
+            )
+            hubert_feat_full = hubert_feat_full.swapaxes(-1, -2)
+
+        return audio_emb_full.float(), None if hubert_feat_full is None else hubert_feat_full.float()
+
     
     def _generate_gesture_window_from_audio(
         self, 
@@ -766,111 +862,67 @@ class DiffSHEGRealtimeWrapper:
         
         # Convert raw bytes to float32 audio for processing
         audio_int16 = np.frombuffer(audio_bytes_full, dtype=np.int16)
+        if audio_int16.size == 0:
+            return []
         audio_float = audio_int16.astype(np.float32) / 32767.0
-        
-        # Calculate the starting frame index for this window
-        # Frames index the gesture poses from the beginning of the utterance
-        window_start_frame = int(window_start_sample / sample_rate * gesture_fps)
-        full_audio_duration = len(audio_bytes_full) / 2 / sample_rate  # 2 bytes per sample
-        
-        self.logger.debug(f"Utterance {utterance_id} generating window: start_frame={window_start_frame}, full_audio_duration={full_audio_duration:.3f}s, has_overlap_context={overlap_context is not None}")
-        
-        # === CRITICAL FIX: Extract features from FULL audio, then window them ===
-        # Following official code pattern from trainers/ddpm_beat_trainer.py lines 1243-1265
-        
-        # Step 1: Resample to 18kHz for mel spectrogram (full audio)
-        aud_18k = librosa.resample(audio_float, orig_sr=sample_rate, target_sr=18000)
-        
-        # Step 2: Extract mel spectrogram for FULL audio
-        mel_full = librosa.feature.melspectrogram(y=aud_18k, sr=18000, hop_length=1200, n_mels=128)
-        mel_full = mel_full[..., :-1]  # Remove last frame (following official code)
-        audio_emb_full = torch.from_numpy(np.swapaxes(mel_full, -1, -2))  # [T_full, 128]
-        audio_emb_full = audio_emb_full.unsqueeze(0).to(self.device)  # [1, T_full, 128]
-        
-        # Step 3: Extract HuBERT features for FULL audio (if enabled)
-        add_cond = {}
-        if self.use_hubert and self.hubert_model is not None:
-            # HuBERT expects 16kHz audio (use original audio_float, not resampled)
-            audio_16k_tensor = torch.from_numpy(audio_float).unsqueeze(0).to(self.device)
-            hubert_feat_full = self._get_hubert_from_16k_speech(audio_16k_tensor)  # [T_hubert, 1024]
-            
-            # Interpolate HuBERT to match mel spectrogram frames (full audio)
-            # Following official code: swapaxes, unsqueeze, interpolate, swapaxes back
-            hubert_feat_full = hubert_feat_full.swapaxes(-1, -2).unsqueeze(0)  # [1, 1024, T_hubert]
-            hubert_feat_full = F.interpolate(
-                hubert_feat_full,
-                size=audio_emb_full.shape[1],  # Match full mel frames
-                mode='linear',
-                align_corners=True
-            )  # [1, 1024, T_full]
-            hubert_feat_full = hubert_feat_full.swapaxes(-1, -2)  # [1, T_full, 1024]
-            
-            self.logger.debug(f"Utterance {utterance_id} HuBERT features extracted: full_shape={hubert_feat_full.shape}")
-        
-        # Step 4: Window the features (following official get_windows pattern)
-        # Calculate which window index we need
-        window_step_frames = self.window_step
-        window_size_frames = self.window_size
-        
-        # The window starts at start_frame in the gesture timeline
-        # Convert to mel/feature frame index
-        # Since mel hop_length=1200 at 18kHz, 1 mel frame = 1200/18000 = 0.0667s
-        # And gesture fps=15, 1 gesture frame = 1/15 = 0.0667s
-        # So mel frames and gesture frames align 1:1 for BEAT dataset!
-        
-        mel_window_start = window_start_frame
-        mel_window_end = mel_window_start + window_size_frames
-        
-        # Extract the window from full features
-        audio_window = audio_emb_full[:, mel_window_start:mel_window_end, :]  # [1, window_size, 128]
-        
-        # Pad or trim to window size
-        target_frames = self.window_size
-        if audio_window.shape[1] < target_frames:
-            padding = target_frames - audio_window.shape[1]
-            audio_window = torch.cat([
-                audio_window,
-                torch.zeros(1, padding, audio_window.shape[2], device=self.device)
-            ], dim=1)
-        elif audio_window.shape[1] > target_frames:
-            audio_window = audio_window[:, :target_frames, :]
-        
-        # Prepare inputs for DiffSHEG
+
+        # Extract full-context audio embeddings (mel + optional HuBERT)
+        audio_emb_full, hubert_feat_full = self._compute_full_audio_features(audio_float, sample_rate)
+        if audio_emb_full is None or audio_emb_full.shape[1] == 0:
+            self.logger.warning(
+                f"Utterance {utterance_id} audio features unavailable (frames={0 if audio_emb_full is None else audio_emb_full.shape[1]}); skipping window."
+            )
+            return []
+
+        window_start_frame = int(round(window_start_sample / sample_rate * gesture_fps))
+        full_audio_duration = audio_float.shape[0] / sample_rate
+        self.logger.debug(
+            f"Utterance {utterance_id} window start={window_start_frame}, audio={full_audio_duration:.3f}s, hubert={hubert_feat_full is not None}"
+        )
+
+        mel_window_start = max(0, window_start_frame)
+        mel_window_end = mel_window_start + self.window_size
+
+        audio_window = audio_emb_full[:, mel_window_start:mel_window_end, :]
+        if audio_window.shape[1] < self.window_size:
+            pad_frames = self.window_size - audio_window.shape[1]
+            pad = audio_emb_full.new_zeros((1, pad_frames, audio_emb_full.shape[2]))
+            audio_window = torch.cat([audio_window, pad], dim=1)
+        elif audio_window.shape[1] > self.window_size:
+            audio_window = audio_window[:, :self.window_size, :]
+
+        audio_window = audio_window.contiguous()
         B, T, _ = audio_window.shape
         C = self.opt.net_dim_pose
-        motions = torch.zeros((B, T, C), device=self.device)
-        
-        # Person ID (default to 0, can be configured)
+        motions = audio_window.new_zeros((B, T, C))
+
         p_id = torch.zeros((1, 1), device=self.device)
         p_id = self.model.one_hot(p_id, self.opt.speaker_dim).to(self.device)
-        
-        # Step 5: Window HuBERT features if they were extracted
-        if self.use_hubert and self.hubert_model is not None:
-            hubert_window = hubert_feat_full[:, mel_window_start:mel_window_end, :]  # [1, window_size, 1024]
-            
-            # Pad or trim to match audio window
-            if hubert_window.shape[1] < target_frames:
-                padding = target_frames - hubert_window.shape[1]
-                hubert_window = torch.cat([
-                    hubert_window,
-                    torch.zeros(1, padding, hubert_window.shape[2], device=self.device)
-                ], dim=1)
-            elif hubert_window.shape[1] > target_frames:
-                hubert_window = hubert_window[:, :target_frames, :]
-            
-            add_cond["pretrain_aud_feat"] = hubert_window
-            self.logger.debug(f"Utterance {utterance_id} HuBERT window extracted: shape={hubert_window.shape}")
-        
+
+        add_cond: Dict[str, torch.Tensor] = {}
+        if hubert_feat_full is not None:
+            hubert_window = hubert_feat_full[:, mel_window_start:mel_window_end, :]
+            if hubert_window.shape[1] < self.window_size:
+                pad_frames = self.window_size - hubert_window.shape[1]
+                pad = hubert_feat_full.new_zeros((1, pad_frames, hubert_window.shape[2]))
+                hubert_window = torch.cat([hubert_window, pad], dim=1)
+            elif hubert_window.shape[1] > self.window_size:
+                hubert_window = hubert_window[:, :self.window_size, :]
+            add_cond["pretrain_aud_feat"] = hubert_window.contiguous()
+            self.logger.debug(
+                f"Utterance {utterance_id} HuBERT window frames={hubert_window.shape[1]}"
+            )
+
         # Inpainting for overlap - use overlap context from previous window for smooth transitions
         inpaint_dict = {}
         if overlap_context is not None and len(overlap_context) == self.overlap_len:
-            inpaint_dict['gt'] = torch.zeros_like(motions)
+            inpaint_dict['gt'] = motions.new_zeros(motions.shape)
             inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
             inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
-            
-            # Use the overlap frames from previous window
-            prev_frames = torch.from_numpy(np.stack(overlap_context)).to(self.device)
-            inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames.unsqueeze(0)
+
+            prev_frames_np = np.stack(overlap_context).astype(np.float32)
+            prev_frames = torch.from_numpy(prev_frames_np).unsqueeze(0).to(self.device)
+            inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames
         
         # Generate gestures (no lock held during model inference)
         with torch.no_grad():

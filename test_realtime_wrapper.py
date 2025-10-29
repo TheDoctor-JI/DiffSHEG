@@ -351,7 +351,7 @@ def main():
     wrapper = DiffSHEGRealtimeWrapper(
         diffsheg_model=trainer,
         opt=opt,
-        default_start_margin=2.5,  # 0.5s margin
+        default_start_margin=0,  # 0.5s margin
         audio_sr=16000,  # From config
         device=opt.device,
         cleanup_timeout=2.0,
