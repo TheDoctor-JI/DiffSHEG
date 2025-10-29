@@ -120,7 +120,7 @@ def audio_to_chunks(audio, sr, chunk_duration=0.04):
         chunk_duration: Chunk duration in seconds (0.04s = 40ms for system audio)
     
     Returns:
-        List of chunks as list of integers (s16le format)
+        List of chunks as list of byte values (0-255), matching app.py pipeline
     """
     chunk_samples = int(sr * chunk_duration)
     audio_int16 = (audio * 32767).astype(np.int16)
@@ -128,8 +128,11 @@ def audio_to_chunks(audio, sr, chunk_duration=0.04):
     chunks = []
     for i in range(0, len(audio_int16), chunk_samples):
         chunk = audio_int16[i:i + chunk_samples]
-        # Convert to list of integers (matching app.py format)
-        chunk_list = chunk.tolist()
+        # Convert to bytes (s16le encoding)
+        chunk_bytes = chunk.tobytes()
+        # Convert bytes to list of byte values (0-255) - matching app.py format
+        # where audio arrives as list of integers and gets converted back via bytes()
+        chunk_list = list(chunk_bytes)
         chunks.append(chunk_list)
     
     return chunks
@@ -157,7 +160,7 @@ def main():
     opt = setup_beat_config(opt)
     
     # Set device
-    opt.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    opt.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     opt.gpu_id = 0
     print(f"Using device: {opt.device}")
     

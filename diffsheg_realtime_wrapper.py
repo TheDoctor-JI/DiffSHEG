@@ -195,7 +195,7 @@ class DiffSHEGRealtimeWrapper:
         opt,
         default_start_margin: float = 0.5,  # Time offset from utterance start to begin gesture generation
         audio_sr: int = 16000,
-        device: str = "cuda",
+        device: str = "cuda:0",
         cleanup_timeout: float = 2.0  # Seconds after playback ends to auto-cleanup
     ):
         """
