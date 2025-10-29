@@ -327,24 +327,31 @@ class DiffSHEGRealtimeWrapper:
                 return
             utterance_id = utterance.utterance_id
         
-        # Get audio data
+        # Calculate time range for this window
+        start_time = start_frame / self.gesture_fps
+        window_end_frame = start_frame + self.window_size
+        end_time = window_end_frame / self.gesture_fps
+        
+        # Get only the audio needed for this window
+        start_sample = int(start_time * self.audio_sr)
+        end_sample = int(end_time * self.audio_sr)
+        
         audio_data = utterance.get_full_audio(self.audio_sr)
         if len(audio_data) == 0:
             return
         
+        # Extract only the window we need
+        audio_window_data = audio_data[start_sample:min(end_sample, len(audio_data))]
+        
         # Resample and extract mel spectrogram (following DiffSHEG pipeline)
-        aud = librosa.resample(audio_data, orig_sr=self.audio_sr, target_sr=18000)
+        aud = librosa.resample(audio_window_data, orig_sr=self.audio_sr, target_sr=18000)
         mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
         mel = mel[..., :-1]
         audio_emb = torch.from_numpy(np.swapaxes(mel, -1, -2))
         audio_emb = audio_emb.unsqueeze(0).to(self.device)
         
-        # Extract window
-        window_end = start_frame + self.window_size
-        if window_end > audio_emb.shape[1]:
-            window_end = audio_emb.shape[1]
-        
-        audio_window = audio_emb[:, start_frame:window_end, :]
+        # Audio embedding should match window size
+        audio_window = audio_emb
         
         # Pad if necessary
         if audio_window.shape[1] < self.window_size:
@@ -391,8 +398,6 @@ class DiffSHEGRealtimeWrapper:
         outputs_np = outputs.cpu().numpy()
         
         # Determine which audio chunks this corresponds to
-        start_time = start_frame / self.gesture_fps
-        end_time = window_end / self.gesture_fps
         start_chunk_idx = self._time_to_chunk_index(utterance, start_time)
         end_chunk_idx = self._time_to_chunk_index(utterance, end_time)
         
@@ -400,7 +405,7 @@ class DiffSHEGRealtimeWrapper:
         segment = GestureSegment(
             utterance_id=utterance_id,
             start_frame=start_frame,
-            end_frame=window_end,
+            end_frame=window_end_frame,
             gestures=outputs_np[0, :self.window_step, :],  # Only keep non-overlapping part
             audio_chunk_range=(start_chunk_idx, end_chunk_idx)
         )
