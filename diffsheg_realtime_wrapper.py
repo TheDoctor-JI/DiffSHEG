@@ -53,36 +53,35 @@ class Utterance:
         self.next_window_start_sample: int = start_margin_samples
         self.next_window_end_sample: int = start_margin_samples + window_duration_samples
     
-    def add_audio_samples(self, audio_data: np.ndarray):
+    def add_audio_samples(self, audio_data):
         """
         Add audio samples to the utterance.
         
         Args:
-            audio_data: Audio samples as numpy array (will be converted to s16le bytes)
+            audio_data: Audio data as list of integers
         """
-        # Convert to int16 and then to bytes
-        if audio_data.dtype != np.int16:
-            audio_int16 = (audio_data * 32767).astype(np.int16)
+        if isinstance(audio_data, list):
+            # Convert list of integers to bytes (as in process_system_reference_audio)
+            audio_bytes = bytes(audio_data)
         else:
-            audio_int16 = audio_data
+            raise TypeError(f"Unsupported audio_data type: {type(audio_data)}")
         
-        audio_bytes = audio_int16.tobytes()
         self.audio_samples.extend(audio_bytes)
     
     def get_total_samples(self) -> int:
         """Get total number of audio samples accumulated."""
         return len(self.audio_samples) // self.bytes_per_sample
     
-    def get_audio_window(self, start_sample: int, end_sample: int) -> np.ndarray:
+    def get_audio_window(self, start_sample: int, end_sample: int) -> bytes:
         """
-        Extract audio samples for a specific window.
+        Extract raw audio bytes for a specific window.
         
         Args:
             start_sample: Starting sample index
             end_sample: Ending sample index (exclusive)
             
         Returns:
-            Audio data as numpy array
+            Raw audio bytes (s16le encoded). Caller is responsible for format conversion.
         """
         start_byte = start_sample * self.bytes_per_sample
         end_byte = end_sample * self.bytes_per_sample
@@ -91,13 +90,9 @@ class Utterance:
         end_byte = min(end_byte, len(self.audio_samples))
         
         if start_byte >= len(self.audio_samples):
-            return np.array([], dtype=np.int16)
+            return bytes()
         
-        window_bytes = bytes(self.audio_samples[start_byte:end_byte])
-        audio_int16 = np.frombuffer(window_bytes, dtype=np.int16)
-        
-        # Convert to float32 in range [-1, 1]
-        return audio_int16.astype(np.float32) / 32767.0
+        return bytes(self.audio_samples[start_byte:end_byte])
     
     def update_window_indices(self):
         """
@@ -271,7 +266,7 @@ class DiffSHEGRealtimeWrapper:
     Utterance lifecycle methods
     '''
 
-    def add_audio_chunk(self, utterance_id: int, chunk_index: int, audio_data: np.ndarray, 
+    def add_audio_chunk(self, utterance_id: int, chunk_index: int, audio_data: list, 
                         duration: float, start_margin: Optional[float] = None):
         """
         Add a new audio chunk from the dialogue system.
@@ -281,8 +276,8 @@ class DiffSHEGRealtimeWrapper:
         Args:
             utterance_id: Unique identifier for the utterance (msg_idx in your system)
             chunk_index: Position of this chunk within the utterance (starts from 0)
-            audio_data: Raw audio data (numpy array)
-            duration: Duration of the chunk in seconds
+            audio_data: Raw audio data (list of integers)
+            duration: Duration of the chunk in seconds (not used internally, kept for API compatibility)
             start_margin: Optional time offset (in seconds) for when gesture generation starts.
                          If None, uses default_start_margin. The first generation window will
                          begin at this offset from the utterance start. For example, with
@@ -464,12 +459,14 @@ class DiffSHEGRealtimeWrapper:
         while self.running:
             time.sleep(0.05)  # 50ms tick
             
-            # Step 1: Check if we have enough samples for the next window
+            # Step 1: Check if we have enough samples for the next window and snapshot everything needed
             should_generate = False
             utterance_id = None
             audio_snapshot = None
             window_start_sample = None
-            window_start_frame = None
+            sample_rate = None
+            gesture_fps = None
+            overlap_context = None  # Snapshot of overlap waypoints for smooth transitions
             
             with self.utterance_lock:
                 utterance = self.current_utterance
@@ -489,19 +486,46 @@ class DiffSHEGRealtimeWrapper:
                 utterance_id = utterance.utterance_id
                 window_start_sample = utterance.next_window_start_sample
                 window_end_sample = utterance.next_window_end_sample
+                sample_rate = utterance.sample_rate
+                gesture_fps = utterance.gesture_fps
                 
-                # Calculate starting frame index for this window
-                # Frames are indexed from the beginning of the utterance at gesture_fps
-                window_start_frame = int(window_start_sample / utterance.sample_rate * utterance.gesture_fps)
-                
-                # Snapshot the audio samples we need
+                # Snapshot the audio bytes we need
                 audio_snapshot = utterance.get_audio_window(window_start_sample, window_end_sample)
+                
+                # Snapshot overlap context if needed for smooth transitions
+                # Frames are gesture poses indexed at gesture_fps (e.g., 15 FPS for BEAT)
+                # Frame index = (sample_index / sample_rate) * gesture_fps
+                # For example: at 16000 Hz and 15 FPS, 1 frame spans ~1067 samples
+                window_start_frame = int(window_start_sample / sample_rate * gesture_fps)
+                
+                if self.overlap_len > 0 and window_start_frame > 0:
+                    # We need the last overlap_len frames before window_start_frame for inpainting
+                    if utterance.gesture_waypoints is not None:
+                        prev_waypoints = []
+                        with utterance.gesture_waypoints.lock:
+                            for i in range(self.overlap_len):
+                                prev_frame = window_start_frame - self.overlap_len + i
+                                if prev_frame >= 0:
+                                    # Find waypoint at this frame index
+                                    for wp in utterance.gesture_waypoints.waypoints:
+                                        if wp.waypoint_index == prev_frame:
+                                            # Deep copy the gesture data to avoid reference issues
+                                            prev_waypoints.append(wp.gesture_data.copy())
+                                            break
+                        
+                        if len(prev_waypoints) == self.overlap_len:
+                            overlap_context = prev_waypoints
             
             # Step 2: Generate gestures without holding the lock
             if should_generate and len(audio_snapshot) > 0:
-                # Generate gestures for this window (releases lock during generation)
+                # Generate gestures for this window
                 waypoints = self._generate_gesture_window_from_audio(
-                    audio_snapshot, window_start_frame, utterance_id
+                    audio_snapshot, 
+                    window_start_sample,
+                    sample_rate,
+                    gesture_fps,
+                    overlap_context,
+                    utterance_id
                 )
                 
                 # Step 3: Write waypoints back and update generation state
@@ -523,29 +547,49 @@ class DiffSHEGRealtimeWrapper:
     
     def _generate_gesture_window_from_audio(
         self, 
-        audio_snapshot: np.ndarray, 
-        start_frame: int,
+        audio_bytes: bytes,
+        window_start_sample: int,
+        sample_rate: int,
+        gesture_fps: int,
+        overlap_context: Optional[List[np.ndarray]],
         utterance_id: int
     ) -> List[GestureWaypoint]:
         """
-        Generate gestures for a window of audio from a snapshot of audio samples.
+        Generate gestures for a window of audio from a snapshot of audio bytes.
         
         This method does NOT hold the utterance lock during generation.
-        It works with a snapshot of audio samples taken from the utterance.
+        It works with snapshots taken from the utterance.
+        
+        Frames are gesture poses indexed at gesture_fps (e.g., 15 FPS for BEAT dataset).
+        Each frame represents one gesture pose at a specific point in time.
+        Frame timing: frame_index = (sample_index / sample_rate) * gesture_fps
+        Example: at 16000 Hz and 15 FPS, frame 0 = sample 0, frame 1 = sample 1067, etc.
         
         Args:
-            audio_snapshot: Audio samples for this window (numpy array, float32 in range [-1, 1])
-            start_frame: Starting frame index for this window (in gesture_fps time)
-            utterance_id: ID of the utterance (for fetching overlap frames)
+            audio_bytes: Raw audio bytes for this window (s16le encoded)
+            window_start_sample: Starting sample index of this window in the full utterance
+            sample_rate: Audio sample rate (e.g., 16000 Hz)
+            gesture_fps: Gesture frame rate (e.g., 15 FPS for BEAT)
+            overlap_context: Optional list of gesture data arrays from previous window's last frames
+                           Used for smooth transitions via inpainting. Length should be overlap_len.
+            utterance_id: ID of the utterance (for debugging/logging)
         
         Returns:
             List of generated waypoints (only the non-overlapping window_step frames)
         """
-        if len(audio_snapshot) == 0:
+        if len(audio_bytes) == 0:
             return []
         
+        # Convert raw bytes to float32 audio for processing
+        audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+        audio_float = audio_int16.astype(np.float32) / 32767.0
+        
+        # Calculate the starting frame index for this window
+        # Frames index the gesture poses from the beginning of the utterance
+        window_start_frame = int(window_start_sample / sample_rate * gesture_fps)
+        
         # Resample and extract mel spectrogram (following DiffSHEG pipeline)
-        aud = librosa.resample(audio_snapshot, orig_sr=self.audio_sr, target_sr=18000)
+        aud = librosa.resample(audio_float, orig_sr=sample_rate, target_sr=18000)
         mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
         mel = mel[..., :-1]
         audio_emb = torch.from_numpy(np.swapaxes(mel, -1, -2))
@@ -576,34 +620,16 @@ class DiffSHEGRealtimeWrapper:
         # Additional conditioning (e.g., HuBERT features)
         add_cond = {}
         
-        # Inpainting for overlap - use last overlap_len frames from previous window
+        # Inpainting for overlap - use overlap context from previous window for smooth transitions
         inpaint_dict = {}
-        if self.overlap_len > 0 and start_frame > 0:
-            # Get previous waypoints for smooth transition
-            # Need to acquire lock briefly to read waypoints
-            with self.utterance_lock:
-                if self.current_utterance and self.current_utterance.utterance_id == utterance_id:
-                    if self.current_utterance.gesture_waypoints is not None:
-                        # We need the last overlap_len waypoints before start_frame
-                        prev_waypoints = []
-                        for i in range(self.overlap_len):
-                            prev_frame = start_frame - self.overlap_len + i
-                            if prev_frame >= 0:
-                                # Find waypoint at this frame index
-                                with self.current_utterance.gesture_waypoints.lock:
-                                    for wp in self.current_utterance.gesture_waypoints.waypoints:
-                                        if wp.waypoint_index == prev_frame:
-                                            prev_waypoints.append(wp.gesture_data)
-                                            break
-                        
-                        if len(prev_waypoints) == self.overlap_len:
-                            inpaint_dict['gt'] = torch.zeros_like(motions)
-                            inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
-                            inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
-                            
-                            # Use the overlap frames from previous window
-                            prev_frames = torch.from_numpy(np.stack(prev_waypoints)).to(self.device)
-                            inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames.unsqueeze(0)
+        if overlap_context is not None and len(overlap_context) == self.overlap_len:
+            inpaint_dict['gt'] = torch.zeros_like(motions)
+            inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
+            inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
+            
+            # Use the overlap frames from previous window
+            prev_frames = torch.from_numpy(np.stack(overlap_context)).to(self.device)
+            inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames.unsqueeze(0)
         
         # Generate gestures (no lock held during model inference)
         with torch.no_grad():
@@ -617,8 +643,8 @@ class DiffSHEGRealtimeWrapper:
         # Only create waypoints for the non-overlapping part (window_step frames)
         waypoints = []
         for i in range(self.window_step):
-            frame_index = start_frame + i
-            timestamp = frame_index / self.gesture_fps  # Time in seconds from utterance start
+            frame_index = window_start_frame + i
+            timestamp = frame_index / gesture_fps  # Time in seconds from utterance start
             
             waypoint = GestureWaypoint(
                 waypoint_index=frame_index,
@@ -647,7 +673,7 @@ if __name__ == "__main__":
     # wrapper.start()
     # 
     # # Add audio chunks as they arrive from your audio system
-    # # Audio data should be numpy arrays (float32 in range [-1, 1] or int16)
+    # # Audio data can be: bytes, bytearray, list of integers (as from app.py), or numpy arrays
     # # Playback starts automatically when chunk_index=0 arrives
     # wrapper.add_audio_chunk(utterance_id=1, chunk_index=0, audio_data=chunk0, duration=0.1)  # Playback starts here
     # wrapper.add_audio_chunk(utterance_id=1, chunk_index=1, audio_data=chunk1, duration=0.1)
