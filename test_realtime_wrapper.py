@@ -112,31 +112,70 @@ class WaypointCollector:
             all_poses[last_frame_idx+1:] = all_poses[last_frame_idx]
             print(f"[EXPORT] Filled frames {last_frame_idx+1}-{total_audio_frames-1} with last waypoint pose")
         
-        # === CRITICAL: Split FIRST, then denormalize separately ===
-        # Model outputs normalized data in concatenated space (192 dims)
-        # Following official code pattern: split normalized data, then denormalize each part separately
-        # This is KEY: zeros in gesture space should map to gesture mean, not combined mean!
+        # === CRITICAL: Split FIRST, then handle axis-angle to Euler conversion ===
+        # Model outputs normalized axis-angle representation (opt.axis_angle=True by default)
+        # We need to: denormalize axis-angle -> convert to Euler -> denormalize Euler -> BVH
         
         # Split into gesture (141) and expression (51) while still normalized
-        gestures_normalized = all_poses[:, :self.split_pos]      # (T, 141) - still normalized
+        gestures_normalized = all_poses[:, :self.split_pos]      # (T, 141) - still normalized axis-angle
         expressions_normalized = all_poses[:, self.split_pos:]   # (T, 51) - still normalized
         
         print(f"[EXPORT] Split normalized poses: gestures={gestures_normalized.shape}, expressions={expressions_normalized.shape}")
         
-        # Load normalization statistics (separate for gesture and expression)
-        mean_pose_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_mean.npy"
-        std_pose_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_std.npy"
+        # Check if model uses axis-angle representation (default is True)
+        use_axis_angle = getattr(trainer.opt, 'axis_angle', True)
         
-        mean_pose = torch.from_numpy(np.load(mean_pose_path)).float()  # (141,)
-        std_pose = torch.from_numpy(np.load(std_pose_path)).float()    # (141,)
-        
-        print(f"[EXPORT] Loaded gesture normalization stats: mean={mean_pose.shape}, std={std_pose.shape}")
-        
-        # === Gesture Processing ===
-        # Denormalize gestures using GESTURE-ONLY statistics
-        gestures_tensor = torch.from_numpy(gestures_normalized).unsqueeze(0)  # (1, T, 141)
-        denorm_gestures = gestures_tensor * std_pose + mean_pose  # Denormalize: (normalized * std) + mean
-        denorm_gestures_np = denorm_gestures.squeeze(0).numpy()  # (T, 141)
+        if use_axis_angle:
+            print(f"[EXPORT] Converting axis-angle -> Euler angles (opt.axis_angle=True)")
+            
+            # Load axis-angle normalization statistics (motion_mean/motion_std from dataset)
+            # These are stored in train/axis_angle_mean.npy and train/axis_angle_std.npy
+            mean_axis_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/axis_angle_mean.npy"
+            std_axis_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/axis_angle_std.npy"
+            
+            motion_mean = torch.from_numpy(np.load(mean_axis_path)).float()  # (141,) - axis-angle mean
+            motion_std = torch.from_numpy(np.load(std_axis_path)).float()    # (141,) - axis-angle std
+            
+            # Load Euler angle statistics for final output (mean_pose/std_pose)
+            mean_euler_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_mean.npy"
+            std_euler_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_std.npy"
+            
+            mean_pose = torch.from_numpy(np.load(mean_euler_path)).float()  # (141,) - Euler mean
+            std_pose = torch.from_numpy(np.load(std_euler_path)).float()    # (141,) - Euler std
+            
+            print(f"[EXPORT] Loaded stats: motion_mean/std={motion_mean.shape}, mean_pose/std_pose={mean_pose.shape}")
+            
+            # Step 1: Denormalize from axis-angle normalized space
+            gestures_tensor = torch.from_numpy(gestures_normalized).unsqueeze(0)  # (1, T, 141)
+            denorm_axis_angle = gestures_tensor * motion_std + motion_mean  # Denormalize to axis-angle
+            
+            # Step 2: Convert axis-angle to Euler angles (radians)
+            B, T, C = denorm_axis_angle.shape
+            euler_rad = rot_cvt.axis_angle_to_euler_angles(denorm_axis_angle.reshape(B, T, C//3, 3)).reshape(B, T, C)
+            
+            # Step 3: Convert radians to degrees
+            euler_deg = euler_rad * (180 / np.pi)
+            
+            # Step 4: Re-normalize in Euler space and denormalize for final output
+            euler_normalized = (euler_deg - mean_pose) / std_pose
+            denorm_gestures = euler_normalized * std_pose + mean_pose  # Final Euler angles in degrees
+            denorm_gestures_np = denorm_gestures.squeeze(0).numpy()  # (T, 141)
+            
+            print(f"[EXPORT] Converted axis-angle -> Euler angles (degrees): shape={denorm_gestures_np.shape}")
+        else:
+            print(f"[EXPORT] Using Euler angles directly (opt.axis_angle=False)")
+            
+            # Load Euler angle normalization statistics
+            mean_euler_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_mean.npy"
+            std_euler_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_std.npy"
+            
+            mean_pose = torch.from_numpy(np.load(mean_euler_path)).float()  # (141,)
+            std_pose = torch.from_numpy(np.load(std_euler_path)).float()    # (141,)
+            
+            # Denormalize Euler angles directly
+            gestures_tensor = torch.from_numpy(gestures_normalized).unsqueeze(0)  # (1, T, 141)
+            denorm_gestures = gestures_tensor * std_pose + mean_pose  # Denormalize Euler angles
+            denorm_gestures_np = denorm_gestures.squeeze(0).numpy()  # (T, 141)
         
         print(f"[EXPORT] Denormalized gestures: shape={denorm_gestures_np.shape}")
         

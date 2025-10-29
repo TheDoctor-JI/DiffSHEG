@@ -334,9 +334,8 @@ class DDPMTrainer_beat(object):
 
     def one_hot(self, ids, dim):
         ones_eye = torch.eye(dim, device=ids.device)
-        idx = ids.long().view(-1)              # [B] or [B*?]
-        out = ones_eye[idx]                    # [B, dim]
-        return out.view(ids.shape[0], -1)      # [B, dim] - preserve batch dimension
+        return (ones_eye[ids.long()].squeeze())
+
     
 
     def train(self, train_dataset, val_dataset):
