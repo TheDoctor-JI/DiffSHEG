@@ -92,16 +92,20 @@ class WaypointCollector:
             if 0 <= frame_idx < total_audio_frames:
                 all_poses[frame_idx] = waypoint['gesture_data']
         
-        # For frames without waypoints (before first waypoint or after last),
-        # we can either leave them as zero or copy the nearest valid frame
-        # Let's use forward-fill and backward-fill strategy
+        # For frames without waypoints (before first waypoint or after last):
+        # - Before first waypoint: Keep as zeros (neutral pose in normalized space)
+        # - After last waypoint: Copy last valid frame to hold final pose
+        # 
+        # CRITICAL: Zeros in normalized space = neutral pose!
+        # Since waypoints are in normalized space (model output after mean subtraction),
+        # zeros represent the mean pose (neutral standing position).
         first_frame_idx = int(np.round(self.first_timestamp * self.gesture_fps))
         last_frame_idx = int(np.round(self.last_timestamp * self.gesture_fps))
         
-        # Forward fill: copy first valid frame to all frames before it
+        # Keep frames before first waypoint as zeros (neutral pose)
         if first_frame_idx > 0:
-            all_poses[:first_frame_idx] = all_poses[first_frame_idx]
-            print(f"[EXPORT] Filled frames 0-{first_frame_idx-1} with first waypoint pose")
+            # all_poses[:first_frame_idx] already zeros from initialization
+            print(f"[EXPORT] Frames 0-{first_frame_idx-1} kept as zeros (neutral pose in normalized space)")
         
         # Backward fill: copy last valid frame to all frames after it
         if last_frame_idx < total_audio_frames - 1:
