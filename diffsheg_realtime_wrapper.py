@@ -233,10 +233,18 @@ class DiffSHEGRealtimeWrapper:
             audio_sr if audio_sr is not None
             else gesture_config.get('audio_sr', 16000)
         )
-        self.device = (
+        
+        # Handle device - ensure it's a torch.device object
+        device_str = (
             device if device is not None
             else gesture_config.get('gpu_device', str(opt.device))
         )
+        # Convert string to torch.device if necessary
+        if isinstance(device_str, str):
+            self.device = torch.device(device_str)
+        else:
+            self.device = device_str
+            
         self.cleanup_timeout = (
             cleanup_timeout if cleanup_timeout is not None
             else gesture_config.get('cleanup_timeout', 2.0)
@@ -249,7 +257,7 @@ class DiffSHEGRealtimeWrapper:
             terminal_log_level="INFO"
         )
         self.logger.info("DiffSHEG Realtime Wrapper initialized")
-        self.logger.info(f"Configuration: sample_rate={audio_sr}, device={device}, start_margin={default_start_margin}s")
+        self.logger.info(f"Configuration: sample_rate={self.audio_sr}, device={self.device}, start_margin={self.default_start_margin}s")
         
         # Check if HuBERT features are needed
         self.use_hubert = getattr(opt, 'addHubert', False) or getattr(opt, 'expAddHubert', False)
@@ -258,7 +266,7 @@ class DiffSHEGRealtimeWrapper:
             from transformers import Wav2Vec2Processor, HubertModel
             self.wav2vec2_processor = Wav2Vec2Processor.from_pretrained("facebook/hubert-large-ls960-ft")
             self.hubert_model = HubertModel.from_pretrained("facebook/hubert-large-ls960-ft")
-            self.hubert_model = self.hubert_model.to(device)
+            self.hubert_model = self.hubert_model.to(self.device)
             self.hubert_model.eval()
             self.logger.info("HuBERT models loaded successfully")
         else:
