@@ -1066,6 +1066,14 @@ class DiffSHEGRealtimeWrapper:
 
         p_id = torch.zeros((1, 1), device=self.device) + 2 ## Use pid 2
         p_id = self.model.one_hot(p_id, self.opt.speaker_dim).to(self.device)
+        
+        # Safety check: ensure person_id has batch dimension [B, speaker_dim]
+        # The one_hot fix should handle this, but we add a safeguard
+        if p_id.dim() == 1:
+            p_id = p_id.unsqueeze(0)
+            self.logger.warning(
+                f"Utterance {utterance_id}: person_id missing batch dim, fixing to shape {p_id.shape}"
+            )
 
         add_cond: Dict[str, torch.Tensor] = {}
         if hubert_feat_full is not None:

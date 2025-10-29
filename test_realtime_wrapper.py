@@ -339,6 +339,22 @@ def main():
     print("Initializing trainer...")
     trainer = DDPMTrainer_beat(opt, model, eval_model=None)
     
+    # Set test mode before loading checkpoint (mirrors runner.py test methods)
+    opt.is_train = False
+    
+    # Load trained weights (mirror runner.py)
+    opt.save_root = os.path.join(opt.checkpoints_dir, opt.dataset_name, opt.name)
+    opt.model_dir = os.path.join(opt.save_root, 'model')
+    ckpt_path = os.path.join(opt.model_dir, opt.ckpt)
+    print(f"Loading checkpoint: {ckpt_path}")
+    trainer.load(ckpt_path)
+    trainer.encoder.eval()
+    
+    # Enable HuBERT conditioning to match checkpoint training config
+    # The checkpoint name 'beat_GesExpr_unify_addHubert_encodeHubert_mlpIncludeX_condRes_LN' indicates HuBERT was used
+    print("Enabling HuBERT conditioning (checkpoint was trained with addHubert)")
+    opt.addHubert = True
+    
     # Initialize waypoint collector
     print("Initializing waypoint collector...")
     waypoint_collector = WaypointCollector(
