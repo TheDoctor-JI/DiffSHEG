@@ -16,39 +16,99 @@ import torch
 import librosa
 
 
-@dataclass
-class AudioChunk:
-    """Represents a single audio chunk from the dialogue system."""
-    utterance_id: int
-    chunk_index: int
-    audio_data: np.ndarray  # Raw audio at original sample rate
-    timestamp: float  # When this chunk was received
-    duration: float  # Duration in seconds
-
-
-@dataclass
 class Utterance:
-    """Tracks an ongoing or completed utterance."""
-    utterance_id: int
-    chunks: List[AudioChunk] = field(default_factory=list)
-    start_time: Optional[float] = None
-    current_chunk_playing: int = 0
-    generation_started: bool = False  # Whether we've started generating for this utterance
-    start_margin: float = 0.5  # When to start generation relative to playback
-    last_chunk_received_time: float = field(default_factory=time.time)  # Track when last chunk arrived
-    gesture_waypoints: Optional['GestureWaypoints'] = None  # Gesture waypoints for this utterance
+    """Tracks an ongoing or completed utterance with audio stored as concatenated samples."""
     
-    def get_full_audio(self, sample_rate: int = 16000) -> np.ndarray:
-        """Concatenate all audio chunks into a single array."""
-        if not self.chunks:
-            return np.array([])
-        return np.concatenate([chunk.audio_data for chunk in self.chunks])
+    def __init__(
+        self, 
+        utterance_id: int,
+        start_margin: float,
+        sample_rate: int,
+        gesture_fps: int,
+        window_size: int,
+        window_step: int,
+        gesture_waypoints: 'GestureWaypoints'
+    ):
+        self.utterance_id = utterance_id
+        self.start_time: Optional[float] = None
+        self.start_margin = start_margin  # Time offset (in seconds) from utterance start where gesture generation begins
+        self.last_chunk_received_time: float = None # Track when last chunk arrived
+        self.gesture_waypoints = gesture_waypoints  # Gesture waypoints for this utterance
+        
+        # Audio storage: concatenated samples instead of chunks
+        self.sample_rate = sample_rate
+        self.audio_samples: bytearray = bytearray()  # Concatenated raw audio samples (s16le encoded)
+        self.bytes_per_sample = 2  # s16le encoding uses 2 bytes per sample
+        
+        # Generation state: tracks which audio window to generate next (in terms of sample indices)
+        self.gesture_fps = gesture_fps
+        self.window_size = window_size  # Number of frames per window
+        self.window_step = window_step  # Number of non-overlapping frames per window
+        
+        # Initialize window indices based on start_margin
+        # First window starts at start_margin seconds into the utterance
+        start_margin_samples = int(start_margin * sample_rate)
+        window_duration_samples = int((window_size / gesture_fps) * sample_rate)
+        
+        self.next_window_start_sample: int = start_margin_samples
+        self.next_window_end_sample: int = start_margin_samples + window_duration_samples
     
-    def get_audio_up_to_chunk(self, chunk_index: int, sample_rate: int = 16000) -> np.ndarray:
-        """Get audio data up to (and including) a specific chunk."""
-        if chunk_index >= len(self.chunks):
-            return self.get_full_audio(sample_rate)
-        return np.concatenate([self.chunks[i].audio_data for i in range(chunk_index + 1)])
+    def add_audio_samples(self, audio_data: np.ndarray):
+        """
+        Add audio samples to the utterance.
+        
+        Args:
+            audio_data: Audio samples as numpy array (will be converted to s16le bytes)
+        """
+        # Convert to int16 and then to bytes
+        if audio_data.dtype != np.int16:
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+        else:
+            audio_int16 = audio_data
+        
+        audio_bytes = audio_int16.tobytes()
+        self.audio_samples.extend(audio_bytes)
+    
+    def get_total_samples(self) -> int:
+        """Get total number of audio samples accumulated."""
+        return len(self.audio_samples) // self.bytes_per_sample
+    
+    def get_audio_window(self, start_sample: int, end_sample: int) -> np.ndarray:
+        """
+        Extract audio samples for a specific window.
+        
+        Args:
+            start_sample: Starting sample index
+            end_sample: Ending sample index (exclusive)
+            
+        Returns:
+            Audio data as numpy array
+        """
+        start_byte = start_sample * self.bytes_per_sample
+        end_byte = end_sample * self.bytes_per_sample
+        
+        # Clamp to available data
+        end_byte = min(end_byte, len(self.audio_samples))
+        
+        if start_byte >= len(self.audio_samples):
+            return np.array([], dtype=np.int16)
+        
+        window_bytes = bytes(self.audio_samples[start_byte:end_byte])
+        audio_int16 = np.frombuffer(window_bytes, dtype=np.int16)
+        
+        # Convert to float32 in range [-1, 1]
+        return audio_int16.astype(np.float32) / 32767.0
+    
+    def update_window_indices(self):
+        """
+        Update window indices for the next generation window.
+        Advances by window_step frames worth of samples.
+        """
+        step_duration_samples = int((self.window_step / self.gesture_fps) * self.sample_rate)
+        window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
+        
+        self.next_window_start_sample += step_duration_samples
+        self.next_window_end_sample = self.next_window_start_sample + window_duration_samples
 
 
 @dataclass
@@ -124,14 +184,15 @@ class DiffSHEGRealtimeWrapper:
     Features:
     - Tracks utterance lifecycle and audio chunks
     - Schedules gesture generation with configurable start margin
-    - Manages two threads: playback monitoring and generation scheduling
+    - Manages two threads: playback monitoring and gesture generation
+    - Generation thread uses snapshot-based approach for lock-free inference
     """
     
     def __init__(
         self,
         diffsheg_model,
         opt,
-        default_start_margin: float = 0.5,  # Default time ahead of playback to start generation
+        default_start_margin: float = 0.5,  # Time offset from utterance start to begin gesture generation
         audio_sr: int = 16000,
         device: str = "cuda",
         cleanup_timeout: float = 2.0  # Seconds after playback ends to auto-cleanup
@@ -142,11 +203,11 @@ class DiffSHEGRealtimeWrapper:
         Args:
             diffsheg_model: The DiffSHEG trainer instance (DDPMTrainer_beat)
             opt: Configuration options
-            default_start_margin: Default start margin for new utterances. Used once per utterance
-                                 to determine when to start generating gestures relative to playback.
-                                 E.g., if playback starts at t=0, start generation when we have audio
-                                 up to t=start_margin. Since generation is faster than realtime, this
-                                 one-time delay ensures gestures are ready before playback needs them.
+            default_start_margin: Time offset (in seconds) from utterance start where gesture 
+                                 generation begins. For example, if start_margin=0.5, the first
+                                 generation window will start at 0.5s into the utterance.
+                                 This ensures gestures are ready before playback needs them,
+                                 since generation is faster than realtime.
             audio_sr: Audio sample rate
             device: Computing device
             cleanup_timeout: Seconds to wait after playback ends before auto-cleanup
@@ -164,9 +225,6 @@ class DiffSHEGRealtimeWrapper:
         
         # Track cancelled/timed-out utterances to reject late-arriving chunks
         self.cancelled_utterances: set = set()  # Set of utterance_ids that have been cancelled or timed out
-        
-        # Generation state
-        self.last_generated_waypoint_index: int = -1  # Track which waypoint index was last generated
         
         # Threading
         self.running = False
@@ -202,13 +260,12 @@ class DiffSHEGRealtimeWrapper:
         """
         Reset all state-related variables.
         
-        This clears the current utterance, cancellation history, and generation state.
+        This clears the current utterance and cancellation history.
         Useful for starting fresh or cleaning up after a session ends.
         """
         with self.utterance_lock:
             self.current_utterance = None
             self.cancelled_utterances.clear()
-            self.last_generated_waypoint_index = -1
     
     '''
     Utterance lifecycle methods
@@ -226,21 +283,18 @@ class DiffSHEGRealtimeWrapper:
             chunk_index: Position of this chunk within the utterance (starts from 0)
             audio_data: Raw audio data (numpy array)
             duration: Duration of the chunk in seconds
-            start_margin: Optional start margin for this specific utterance. If None, uses default.
+            start_margin: Optional time offset (in seconds) for when gesture generation starts.
+                         If None, uses default_start_margin. The first generation window will
+                         begin at this offset from the utterance start. For example, with
+                         start_margin=0.5, generation begins at t=0.5s into the utterance.
         """
         # Reject chunks for cancelled/timed-out utterances
         if utterance_id in self.cancelled_utterances:
             # Silently ignore - this is expected for late-arriving chunks after cancellation
             return
-    
-        chunk = AudioChunk(
-            utterance_id=utterance_id,
-            chunk_index=chunk_index,
-            audio_data=audio_data,
-            timestamp=time.time(),
-            duration=duration
-        )
         
+        curren_time = time.time()
+
         with self.utterance_lock:
             # Double-check after acquiring lock (in case it was cancelled while we were creating the chunk)
             if utterance_id in self.cancelled_utterances:
@@ -257,23 +311,24 @@ class DiffSHEGRealtimeWrapper:
                 self.current_utterance = Utterance(
                     utterance_id=utterance_id,
                     start_margin=margin,
+                    sample_rate=self.audio_sr,
+                    gesture_fps=self.gesture_fps,
+                    window_size=self.window_size,
+                    window_step=self.window_step,
                     gesture_waypoints=GestureWaypoints(gesture_fps=self.gesture_fps)
                 )
-                self.last_generated_waypoint_index = -1
             
             utterance = self.current_utterance
             
             # Update last chunk received time
-            utterance.last_chunk_received_time = chunk.timestamp
+            utterance.last_chunk_received_time = curren_time
             
             # Automatically start playback when first chunk arrives, we log the timestamp here
             if chunk_index == 0 and utterance.start_time is None:
-                utterance.start_time = chunk.timestamp
+                utterance.start_time = curren_time
             
-            # Insert chunk at correct position
-            while len(utterance.chunks) <= chunk_index:
-                utterance.chunks.append(None)
-            utterance.chunks[chunk_index] = chunk
+            # Add audio samples to utterance
+            utterance.add_audio_samples(audio_data)
     
     def cancel_utterance(self, utterance_id: int):
         """
@@ -298,7 +353,6 @@ class DiffSHEGRealtimeWrapper:
                 # Simply discard everything - generation is faster than realtime
                 # so we can regenerate from scratch for the next utterance
                 self.current_utterance = None
-                self.last_generated_waypoint_index = -1
     
     def _cleanup_current_utterance(self):
         """
@@ -312,7 +366,6 @@ class DiffSHEGRealtimeWrapper:
                 self.cancelled_utterances.add(self.current_utterance.utterance_id)
     
             self.current_utterance = None
-            self.last_generated_waypoint_index = -1
 
 
     '''
@@ -357,7 +410,8 @@ class DiffSHEGRealtimeWrapper:
                 elapsed_time = iteration_start_time - utterance.start_time
                 
                 # Calculate total audio duration received so far
-                total_audio_duration = sum(chunk.duration for chunk in utterance.chunks if chunk is not None)
+                total_samples = utterance.get_total_samples()
+                total_audio_duration = total_samples / utterance.sample_rate
                 
 
                 # Auto-cleanup: if playback has passed all audio AND no new chunks for cleanup_timeout
@@ -393,18 +447,29 @@ class DiffSHEGRealtimeWrapper:
 
     def _generation_loop(self):
         """
-        Thread 2: Monitor available audio and schedule gesture generation.
-        Uses sliding window approach to generate gestures incrementally.
+        Thread 2: Monitor available audio and trigger gesture generation windows.
         
         Generation strategy:
-        - Use start_margin once per utterance to determine when to start generation
-        - Wait until we have audio_duration >= start_margin before starting generation
-        - Once started, generate continuously since generation is faster than realtime
-        - Generates waypoints at 15 FPS (one waypoint every ~66.67ms)
-        - Uses sliding window with overlap for smooth transitions
+        - Window indices are initialized automatically when utterance is created
+        - Wait until enough audio samples are available to fill next_window_end_sample
+        - Snapshot the required audio samples, release lock, and generate gestures
+        - After generation, acquire lock and write waypoints back (if utterance still exists)
+        - Update window indices using utterance.update_window_indices() for next generation
+        
+        Desired behaviors:
+        - start_margin controls where the first window begins (not from t=0)
+        - If utterance tail is insufficient for a full window, no generation is triggered
+        - Generation naturally stays ahead of playback since it's faster than realtime
         """
         while self.running:
             time.sleep(0.05)  # 50ms tick
+            
+            # Step 1: Check if we have enough samples for the next window
+            should_generate = False
+            utterance_id = None
+            audio_snapshot = None
+            window_start_sample = None
+            window_start_frame = None
             
             with self.utterance_lock:
                 utterance = self.current_utterance
@@ -412,87 +477,75 @@ class DiffSHEGRealtimeWrapper:
                 if utterance is None:
                     continue
                 
-                # Check if we have any audio chunks
-                if not utterance.chunks or all(c is None for c in utterance.chunks):
+                # Check if we have enough samples for the next window
+                available_samples = utterance.get_total_samples()
+                
+                if available_samples < utterance.next_window_end_sample:
+                    # Not enough samples yet, wait for more
                     continue
                 
-                # Calculate total audio duration available
-                audio_duration = sum(chunk.duration for chunk in utterance.chunks if chunk is not None)
+                # We have enough samples, prepare to generate
+                should_generate = True
+                utterance_id = utterance.utterance_id
+                window_start_sample = utterance.next_window_start_sample
+                window_end_sample = utterance.next_window_end_sample
                 
-                # Check if we should start generation for this utterance
-                if not utterance.generation_started:
-                    # Wait until we have enough audio (start_margin) before starting generation
-                    if audio_duration < utterance.start_margin:
+                # Calculate starting frame index for this window
+                # Frames are indexed from the beginning of the utterance at gesture_fps
+                window_start_frame = int(window_start_sample / utterance.sample_rate * utterance.gesture_fps)
+                
+                # Snapshot the audio samples we need
+                audio_snapshot = utterance.get_audio_window(window_start_sample, window_end_sample)
+            
+            # Step 2: Generate gestures without holding the lock
+            if should_generate and len(audio_snapshot) > 0:
+                # Generate gestures for this window (releases lock during generation)
+                waypoints = self._generate_gesture_window_from_audio(
+                    audio_snapshot, window_start_frame, utterance_id
+                )
+                
+                # Step 3: Write waypoints back and update generation state
+                with self.utterance_lock:
+                    utterance = self.current_utterance
+                    
+                    # Check if this utterance is still current (not cancelled)
+                    if utterance is None or utterance.utterance_id != utterance_id:
+                        # Utterance was cancelled, discard waypoints
                         continue
-                    # Mark generation as started
-                    utterance.generation_started = True
-                
-                # Calculate the next waypoint index to generate
-                # Each window generates window_step waypoints (e.g., 30 waypoints per window)
-                next_waypoint_index = self.last_generated_waypoint_index + 1
-                
-                # Calculate which window this waypoint belongs to
-                # For the first waypoint (index 0), we start at window 0
-                # For waypoint 30, we need window 1, etc.
-                if next_waypoint_index == 0:
-                    window_start_frame = 0
-                else:
-                    # Each window produces window_step new waypoints
-                    window_number = (next_waypoint_index + self.overlap_len) // self.window_step
-                    window_start_frame = window_number * self.window_step
-                
-                # Check if we need to generate a new window
-                # We need audio for the full window (window_size frames at gesture_fps)
-                window_end_frame = window_start_frame + self.window_size
-                window_end_time = window_end_frame / self.gesture_fps
-                
-                if window_end_time > audio_duration:
-                    # Not enough audio for full window yet, wait for more chunks. This will elicit the desire behavior that, for the very tail of an utterance which does not contain a full window, we will simply ignore it.
-                    continue
-                
-                # Generate this window (will produce waypoints from window_start_frame to window_start_frame + window_step)
-                self._generate_gesture_window(window_start_frame)
-                
-                # Update last generated waypoint index
-                # Each window generates window_step new waypoints
-                self.last_generated_waypoint_index = window_start_frame + self.window_step - 1
+                    
+                    # Write waypoints
+                    if waypoints and utterance.gesture_waypoints is not None:
+                        utterance.gesture_waypoints.add_waypoints(waypoints)
+                    
+                    # Update window indices for next generation
+                    utterance.update_window_indices()
+
     
-    def _generate_gesture_window(self, start_frame: int):
+    def _generate_gesture_window_from_audio(
+        self, 
+        audio_snapshot: np.ndarray, 
+        start_frame: int,
+        utterance_id: int
+    ) -> List[GestureWaypoint]:
         """
-        Generate gestures for a single window of audio.
+        Generate gestures for a window of audio from a snapshot of audio samples.
         
-        A window generates window_size frames (e.g., 34 frames), but only the first
-        window_step frames (e.g., 30 frames) are kept as new waypoints. The overlap_len
-        frames (e.g., 4 frames) are used for smooth transitions but not stored as new waypoints.
+        This method does NOT hold the utterance lock during generation.
+        It works with a snapshot of audio samples taken from the utterance.
         
         Args:
-            start_frame: Starting frame index for this window (in gesture_fps time, e.g., 15 FPS)
+            audio_snapshot: Audio samples for this window (numpy array, float32 in range [-1, 1])
+            start_frame: Starting frame index for this window (in gesture_fps time)
+            utterance_id: ID of the utterance (for fetching overlap frames)
+        
+        Returns:
+            List of generated waypoints (only the non-overlapping window_step frames)
         """
-        with self.utterance_lock:
-            utterance = self.current_utterance
-            if utterance is None:
-                return
-            utterance_id = utterance.utterance_id
-        
-        # Calculate time range for this window
-        # Frames are at gesture_fps (15 FPS), so frame 0 = 0s, frame 15 = 1s, etc.
-        start_time = start_frame / self.gesture_fps
-        window_end_frame = start_frame + self.window_size
-        end_time = window_end_frame / self.gesture_fps
-        
-        # Get only the audio needed for this window
-        start_sample = int(start_time * self.audio_sr)
-        end_sample = int(end_time * self.audio_sr)
-        
-        audio_data = utterance.get_full_audio(self.audio_sr)
-        if len(audio_data) == 0:
-            return
-        
-        # Extract only the window we need
-        audio_window_data = audio_data[start_sample:min(end_sample, len(audio_data))]
+        if len(audio_snapshot) == 0:
+            return []
         
         # Resample and extract mel spectrogram (following DiffSHEG pipeline)
-        aud = librosa.resample(audio_window_data, orig_sr=self.audio_sr, target_sr=18000)
+        aud = librosa.resample(audio_snapshot, orig_sr=self.audio_sr, target_sr=18000)
         mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
         mel = mel[..., :-1]
         audio_emb = torch.from_numpy(np.swapaxes(mel, -1, -2))
@@ -501,13 +554,15 @@ class DiffSHEGRealtimeWrapper:
         # Audio embedding should match window size
         audio_window = audio_emb
         
-        # Pad if necessary
+        # Pad or trim to window size
         if audio_window.shape[1] < self.window_size:
             padding = self.window_size - audio_window.shape[1]
             audio_window = torch.cat([
                 audio_window,
                 torch.zeros(1, padding, audio_window.shape[2], device=self.device)
             ], dim=1)
+        elif audio_window.shape[1] > self.window_size:
+            audio_window = audio_window[:, :self.window_size, :]
         
         # Prepare inputs for DiffSHEG
         B, T, _ = audio_window.shape
@@ -525,30 +580,32 @@ class DiffSHEGRealtimeWrapper:
         inpaint_dict = {}
         if self.overlap_len > 0 and start_frame > 0:
             # Get previous waypoints for smooth transition
+            # Need to acquire lock briefly to read waypoints
             with self.utterance_lock:
-                if utterance.gesture_waypoints is not None:
-                    # We need the last overlap_len waypoints before start_frame
-                    prev_waypoints = []
-                    for i in range(self.overlap_len):
-                        prev_frame = start_frame - self.overlap_len + i
-                        if prev_frame >= 0:
-                            # Find waypoint at this frame index
-                            with utterance.gesture_waypoints.lock:
-                                for wp in utterance.gesture_waypoints.waypoints:
-                                    if wp.waypoint_index == prev_frame:
-                                        prev_waypoints.append(wp.gesture_data)
-                                        break
-                    
-                    if len(prev_waypoints) == self.overlap_len:
-                        inpaint_dict['gt'] = torch.zeros_like(motions)
-                        inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
-                        inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
+                if self.current_utterance and self.current_utterance.utterance_id == utterance_id:
+                    if self.current_utterance.gesture_waypoints is not None:
+                        # We need the last overlap_len waypoints before start_frame
+                        prev_waypoints = []
+                        for i in range(self.overlap_len):
+                            prev_frame = start_frame - self.overlap_len + i
+                            if prev_frame >= 0:
+                                # Find waypoint at this frame index
+                                with self.current_utterance.gesture_waypoints.lock:
+                                    for wp in self.current_utterance.gesture_waypoints.waypoints:
+                                        if wp.waypoint_index == prev_frame:
+                                            prev_waypoints.append(wp.gesture_data)
+                                            break
                         
-                        # Use the overlap frames from previous window
-                        prev_frames = torch.from_numpy(np.stack(prev_waypoints)).to(self.device)
-                        inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames.unsqueeze(0)
+                        if len(prev_waypoints) == self.overlap_len:
+                            inpaint_dict['gt'] = torch.zeros_like(motions)
+                            inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
+                            inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
+                            
+                            # Use the overlap frames from previous window
+                            prev_frames = torch.from_numpy(np.stack(prev_waypoints)).to(self.device)
+                            inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames.unsqueeze(0)
         
-        # Generate gestures
+        # Generate gestures (no lock held during model inference)
         with torch.no_grad():
             outputs = self.model.generate_batch(
                 audio_window, p_id, C, add_cond, inpaint_dict
@@ -570,10 +627,8 @@ class DiffSHEGRealtimeWrapper:
             )
             waypoints.append(waypoint)
         
-        # Add waypoints to the utterance's gesture waypoints
-        with self.utterance_lock:
-            if utterance.gesture_waypoints is not None:
-                utterance.gesture_waypoints.add_waypoints(waypoints)
+        return waypoints
+
     
 
 # Example usage
@@ -592,6 +647,7 @@ if __name__ == "__main__":
     # wrapper.start()
     # 
     # # Add audio chunks as they arrive from your audio system
+    # # Audio data should be numpy arrays (float32 in range [-1, 1] or int16)
     # # Playback starts automatically when chunk_index=0 arrives
     # wrapper.add_audio_chunk(utterance_id=1, chunk_index=0, audio_data=chunk0, duration=0.1)  # Playback starts here
     # wrapper.add_audio_chunk(utterance_id=1, chunk_index=1, audio_data=chunk1, duration=0.1)
