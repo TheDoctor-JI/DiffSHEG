@@ -1,0 +1,139 @@
+import bpy
+import os
+import json
+
+
+#FACE_FBX_NAME = "iphone_BS_model.fbx"
+# FACE_ANIM_NAME = "C:\\Users\\cjm\\Downloads\\Test\\rendervideo\\rendervideo\\b4_json_rename\\2_scott_0_103_103_GT.json"
+# MOTION_NAME = "C:\\Users\\cjm\\Downloads\\Test\\rendervideo\\rendervideo\\b6_correct_no_root\\res_2_scott_0_103_103_camn.bvh"
+# SOUND_NAME = "C:\\Users\\cjm\\Downloads\\Test\\rendervideo\\rendervideo\\b2_wave_rename\\2_scott_0_103_103.wav"
+# VIDEO_NAME = "C:\\Users\\cjm\\Downloads\\Test\\rendervideo\\rendervideo\\output_camn.mp4"
+#FACE_FBX_PATH = 
+
+
+#INPUT_PATH = os.path.join(MAIN_DIR, "input")
+#OUTPUT_PATH = os.path.join(MAIN_DIR, "output")
+
+
+def assign_facial_animation(animation_data):
+    mesh = bpy.data.objects['Neutral'].data
+    frame_rate = bpy.context.scene.render.fps
+
+    for idx,frame in enumerate(animation_data['frames']):
+        print(f"facial idx: {idx}/{len(animation_data['frames'])}")
+        # if idx > 1000:
+        #     break
+        for w_id, w_val in enumerate(frame['weights']):
+            key_shape_name = animation_data["names"][w_id]
+
+            if key_shape_name in mesh.shape_keys.key_blocks:
+                key_shape = mesh.shape_keys.key_blocks[key_shape_name]
+                key_shape.value = w_val
+                current_frame = frame_rate * frame['time']
+                #print(f"{current_frame} {frame_rate} {frame['time']}")
+                key_shape.keyframe_insert("value", frame=current_frame) 
+                
+    return current_frame
+
+def render_setting(filename, num_frames):
+    bpy.context.scene.render.image_settings.file_format = 'FFMPEG'
+    bpy.context.scene.render.ffmpeg.format = 'MPEG4'
+    area = next(area for area in bpy.context.screen.areas if area.type == 'VIEW_3D')
+    area.spaces[0].region_3d.view_perspective = 'CAMERA'
+    bpy.context.scene.render.filepath = VIDEO_NAME
+    bpy.context.scene.render.fps = 15
+    bpy.data.scenes[0].frame_start = 1
+    bpy.data.scenes[0].frame_end = int(num_frames + 1)
+
+
+def remove_resource():
+    bpy.ops.sequencer.delete()
+    for action in bpy.data.actions:
+        bpy.data.actions.remove(action)
+    for armature in bpy.data.armatures:
+        bpy.data.armatures.remove(armature)
+    for sound in bpy.data.sounds:
+        bpy.data.sounds.remove(sound) 
+    return
+
+
+
+def render_moive(json_file, SOUND_NAME, MOTION_NAME, VIDEO_NAME):
+    # change frame rate
+    bpy.context.scene.render.fps = 15
+
+
+
+#    load skeleton motion
+    bpy.ops.import_anim.bvh(filepath=MOTION_NAME)
+#    bpy.ops.transform.rotate(value=3.14159, orient_axis='-Z', orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', constraint_axis=(False, False, True), mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False)
+    print("load skeleton good")
+    
+    # load facial model (.fbx)
+#    bpy.ops.import_scene.fbx(filepath=)
+#    bpy.ops.transform.resize(value=(0.5, 0.5, 0.5), orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False)
+#    bpy.ops.transform.translate(value=(-121.799, 0, 86.2721), orient_axis_ortho='X', orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', constraint_axis=(False, False, True), mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False)
+#    print("load facial model good")
+    
+    # load facial animation and apply
+    with open(json_file, 'r') as f:
+        df = json.load(f)
+        num_frames = assign_facial_animation(df)
+        print("assign_facial_animation good")
+    
+    # create camera
+    #bpy.ops.object.camera_add(enter_editmode=False, align='VIEW', location=(-52.0, -492.349, 85.4641), rotation=(3.14/2, 0.0, 0.0), scale=(1, 1, 1))
+    #bpy.context.object.data.lens = 15
+    #bpy.context.scene.camera = bpy.context.scene.objects["Camera"]
+    #bpy.context.scene.camera = bpy.data.objects["Camera"]
+#    print("create camera good")
+    
+    #Load Audio
+    oldContext = bpy.context.area.type
+    bpy.context.area.type="SEQUENCE_EDITOR" # select right context
+    bpy.ops.sequencer.sound_strip_add(filepath=SOUND_NAME)
+    bpy.context.area.type=oldContext
+    print("Load Audio good")
+
+    # other setting
+    render_setting(VIDEO_NAME, num_frames)
+
+    # render video
+    print("Rendering ...")
+    bpy.ops.render.opengl(animation=True)
+    print("Render finished")
+    remove_resource()
+
+def findAllFile(base):
+    for root, ds, fs in os.walk(base):
+        for f in fs:
+            yield os.path.join(root,f)
+
+#path_list = os.listdir(MAIN_DIR)
+#path_list.sort()
+# path_list = ["2_scott_0_103_103.wav"]
+# for i, file in enumerate(path_list):
+#     print(f"[{i+1} / {len(path_list)}] {file}")
+    
+    # VIDEO_NAME = os.path.join(MAIN_DIR.replace(FOLDER, 'temp\out_temp'), file.replace('.wav', '.mp4')) 
+    # MOTION_NAME = os.path.join(MAIN_DIR.replace(FOLDER, 'temp\ges_temp'), "res_" + file.replace('.wav', '.bvh'))
+    # FACE_ANIM_NAME = os.path.join(MAIN_DIR.replace(FOLDER, 'temp\exp_temp'), file.replace('.wav', '.json')) 
+    # SOUND_NAME = os.path.join(MAIN_DIR, file) 
+
+    # if os.path.exists(VIDEO_NAME):
+    #     continue
+
+# FACE_ANIM_NAME = r"C:\Users\ChenJunming\OneDrive - HKUST Connect\DOCUME~1\0RESEA~1\GESTUR~1\BEAT_B~1\RENDER~1\TEST_C~1\BEAT_3~1\BESTPC~1\pid_2\EXPRES~1\FACE_J~1\WHAT_I~1.JSO"
+# SOUND_NAME = r"C:\Users\ChenJunming\OneDrive - HKUST Connect\Documents\0 Research Projects\GestureGeneration\BEAT_Blender_Renderer\rendervideo\custom_audios\what_is_chatgpt.wav"
+# MOTION_NAME = r"C:\Users\ChenJunming\OneDrive - HKUST Connect\DOCUME~1\0RESEA~1\GESTUR~1\BEAT_B~1\RENDER~1\TEST_C~1\BEAT_3~1\BESTPC~1\pid_2\gesture\bvh\WHAT_I~1.BVH"
+# VIDEO_NAME = r"C:\Users\ChenJunming\OneDrive - HKUST Connect\Documents\0 Research Projects\GestureGeneration\BEAT_Blender_Renderer\rendervideo\test_custom_audio\beat_34_encoder_GesExpr_VelHuberLoss_unify_expAddHubert_fixStart4\BestPCK_e3559_ddim25\pid_2\what_is_chatgpt.mp4"
+
+# FOLDER = "speech_gt"
+# MAIN_DIR = r"C:\Users\cjm\Downloads\Test\rendervideo\rendervideo\speech_gt" 
+FACE_ANIM_NAME = r"E:\Download\Chrome\BestFGD_e999_ddim25_lastStepInterp\pid_2\expression\face_json\2_scott_0_3_3.json"
+SOUND_NAME = r"E:\Download\Chrome\2_scott_0_3_3.wav"
+MOTION_NAME = r"E:\Download\Chrome\BestFGD_e999_ddim25_lastStepInterp\pid_2\gesture\bvh\2_scott_0_3_3.bvh"
+VIDEO_NAME = r"E:\Download\Chrome\test.mp4"
+render_moive(FACE_ANIM_NAME, SOUND_NAME, MOTION_NAME, VIDEO_NAME)
+
+
