@@ -31,7 +31,6 @@ class Utterance:
     """Tracks an ongoing or completed utterance."""
     utterance_id: int
     chunks: List[AudioChunk] = field(default_factory=list)
-    is_cancelled: bool = False
     start_time: Optional[float] = None
     current_chunk_playing: int = 0
     generation_started: bool = False  # Whether we've started generating for this utterance
@@ -117,11 +116,6 @@ class GestureWaypoints:
             
             return None
     
-    def get_total_waypoints(self) -> int:
-        """Return the total number of waypoints generated so far."""
-        with self.lock:
-            return len(self.waypoints)
-
 
 class DiffSHEGRealtimeWrapper:
     """
