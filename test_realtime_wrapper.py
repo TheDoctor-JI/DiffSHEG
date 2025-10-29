@@ -414,7 +414,7 @@ def main():
     if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK:
         print("\n[SANITY CHECK MODE] Waiting for audio completion and generation...")
         # Wait for sanity check to complete
-        wrapper.sanity_check_generation_complete.wait(timeout=60.0)
+        wrapper.sanity_check_generation_complete.wait()
         print("[SANITY CHECK MODE] Generation complete!")
     else:
         print("\nWaiting for gesture generation and playback to complete...")
