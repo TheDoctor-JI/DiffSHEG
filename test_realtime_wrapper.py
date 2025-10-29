@@ -366,12 +366,13 @@ def main():
     print("Initializing realtime wrapper...")
     
     # Enable non-streaming sanity check mode
+    DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
     print("="*60)
-    print("ENABLING NON_STREAMING_SANITY_CHECK MODE")
+    print(f"{'ENABLING' if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK else 'DISABLING'} NON_STREAMING_SANITY_CHECK MODE")
     print("This will wait for full audio before generating")
     print("="*60)
-    DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
-    
+
+
     wrapper = DiffSHEGRealtimeWrapper(
         diffsheg_model=trainer,
         opt=opt,
