@@ -138,9 +138,6 @@ class WaypointCollector:
         denorm_gestures = gestures_tensor * std_pose + mean_pose  # Denormalize: (normalized * std) + mean
         denorm_gestures_np = denorm_gestures.squeeze(0).numpy()  # (T, 141)
         
-        # Convert to degrees (gestures are in Euler angles)
-        denorm_gestures_np = denorm_gestures_np * (180 / np.pi)
-        
         print(f"[EXPORT] Denormalized gestures: shape={denorm_gestures_np.shape}")
         
         # Save BVH file for gestures
