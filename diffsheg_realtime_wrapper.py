@@ -896,7 +896,7 @@ class DiffSHEGRealtimeWrapper:
         C = self.opt.net_dim_pose
         motions = audio_window.new_zeros((B, T, C))
 
-        p_id = torch.zeros((1, 1), device=self.device)
+        p_id = torch.zeros((1, 1), device=self.device) + 2 ## Use pid 2
         p_id = self.model.one_hot(p_id, self.opt.speaker_dim).to(self.device)
 
         add_cond: Dict[str, torch.Tensor] = {}
@@ -923,6 +923,17 @@ class DiffSHEGRealtimeWrapper:
             prev_frames_np = np.stack(overlap_context).astype(np.float32)
             prev_frames = torch.from_numpy(prev_frames_np).unsqueeze(0).to(self.device)
             inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames
+        elif window_start_frame == 0:
+            # === FIX: Explicitly condition the first frame of the first window on a neutral pose ===
+            # For the very first window, we don't have an overlap context.
+            # We condition the model by providing a neutral pose (zeros in normalized space)
+            # for the first frame to prevent it from starting in a random, potentially unstable state.
+            self.logger.debug(f"Utterance {utterance_id}: First window. Inpainting first frame with neutral pose.")
+            inpaint_dict['gt'] = motions.new_zeros(motions.shape)
+            inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
+            # Set the first frame of the ground truth to zeros (neutral) and mask it for inpainting.
+            inpaint_dict['gt'][:, 0, :] = 0
+            inpaint_dict['outpainting_mask'][:, 0, :] = True
         
         # Generate gestures (no lock held during model inference)
         with torch.no_grad():
