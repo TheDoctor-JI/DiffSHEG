@@ -11,3 +11,6 @@ wandb==0.13.10
 transformers==4.31.0
 pandas==1.4.2
 IPython
+flask
+flask-socketio
+websockets
