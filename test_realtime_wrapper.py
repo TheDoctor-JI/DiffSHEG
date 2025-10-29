@@ -19,6 +19,16 @@ from trainers import DDPMTrainer_beat
 from diffsheg_realtime_wrapper import DiffSHEGRealtimeWrapper
 
 
+def waypoint_handler(waypoint):
+    """
+    Callback function to handle waypoint execution.
+    
+    Args:
+        waypoint: GestureWaypoint object containing waypoint information
+    """
+    print(f"[WAYPOINT] Received waypoint {waypoint.waypoint_index} at timestamp {waypoint.timestamp:.3f}s - gesture_data shape: {waypoint.gesture_data.shape}")
+
+
 def build_model(opt):
     """Build DiffSHEG model"""
     if opt.unidiffuser:
@@ -181,7 +191,8 @@ def main():
         default_start_margin=2.5,  # 0.5s margin
         audio_sr=16000,  # From config
         device=opt.device,
-        cleanup_timeout=2.0
+        cleanup_timeout=2.0,
+        waypoint_callback=waypoint_handler
     )
     
     # Start wrapper threads

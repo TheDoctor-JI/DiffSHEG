@@ -200,7 +200,8 @@ class DiffSHEGRealtimeWrapper:
         default_start_margin: float = None,
         audio_sr: int = None,
         device: str = None,
-        cleanup_timeout: float = None
+        cleanup_timeout: float = None,
+        waypoint_callback = None
     ):
         """
         Initialize the wrapper.
@@ -216,6 +217,9 @@ class DiffSHEGRealtimeWrapper:
             device: Computing device. If None, reads from config or uses opt.device.
             cleanup_timeout: Seconds to wait after playback ends before auto-cleanup.
                            If None, reads from config or uses 2.0.
+            waypoint_callback: Optional callback function to execute waypoints.
+                             Should accept a GestureWaypoint object as parameter.
+                             If None, waypoints are generated but not executed.
         """
         self.model = diffsheg_model
         self.opt = opt
@@ -249,6 +253,9 @@ class DiffSHEGRealtimeWrapper:
             cleanup_timeout if cleanup_timeout is not None
             else gesture_config.get('cleanup_timeout', 2.0)
         )
+        
+        # Store waypoint callback
+        self.waypoint_callback = waypoint_callback
         
         # Initialize logger
         self.logger = setup_logger(
@@ -512,9 +519,9 @@ class DiffSHEGRealtimeWrapper:
                     if waypoint is not None:
                         # Execute waypoint gesture
                         self.logger.debug(f"Utterance {utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
-                        # TODO: Send waypoint gesture to robot control system
-                        # self.send_to_robot(waypoint.gesture_data)
-                        pass
+                        # Call the waypoint callback if provided
+                        if self.waypoint_callback is not None:
+                            self.waypoint_callback(waypoint)
             
             if should_cleanup:
                 self._cleanup_current_utterance()
