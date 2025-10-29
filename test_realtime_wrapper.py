@@ -114,6 +114,7 @@ class WaypointCollector:
         
         print(f"[EXPORT] Split poses: gestures={gestures.shape}, expressions={expressions.shape}")
         
+        # === Gesture Processing ===
         # Load normalization statistics for gestures
         # These are the same stats used during training
         mean_pose_path = f"data/BEAT/beat_cache/{trainer.opt.beat_cache_name}/train/bvh_rot/bvh_mean.npy"
@@ -135,7 +136,7 @@ class WaypointCollector:
         
         print(f"[EXPORT] Denormalized gestures: shape={denorm_gestures_np.shape}")
         
-        # Save BVH file
+        # Save BVH file for gestures
         bvh_dir = os.path.join(output_dir, 'bvh')
         os.makedirs(bvh_dir, exist_ok=True)
         trainer.result2target_vis(
@@ -145,7 +146,9 @@ class WaypointCollector:
         )
         print(f"[EXPORT] Saved BVH to {bvh_dir}/realtime_output.bvh")
         
+        # === Expression Processing ===
         # Convert expressions to JSON format (facial blendshapes)
+        # Note: expressions are still in normalized space, write_face_json will denormalize them
         expressions_expanded = np.expand_dims(expressions, 0)  # (1, T, 51)
         json_dir = os.path.join(output_dir, 'face_json')
         os.makedirs(json_dir, exist_ok=True)
@@ -428,11 +431,12 @@ def main():
     print("Next Steps for Blender Visualization:")
     print("="*60)
     print("1. Open assets/beat_visualize.blend in Blender")
-    print("2. Set paths in the Blender script:")
-    print(f"   - BVH: {os.path.abspath(os.path.join(output_dir, 'bvh', 'realtime_output.bvh'))}")
-    print(f"   - JSON: {os.path.abspath(os.path.join(output_dir, 'face_json', 'realtime_output.json'))}")
-    print(f"   - Audio: {os.path.abspath(audio_output_path)}")
-    print("3. Run the script in Blender to render video")
+    print("2. Open the Scripting tab and update these paths in blender_script_text:")
+    print(f"\n   FACE_ANIM_NAME = r\"{os.path.abspath(os.path.join(output_dir, 'face_json', 'realtime_output.json'))}\"")
+    print(f"   SOUND_NAME = r\"{os.path.abspath(audio_output_path)}\"")
+    print(f"   MOTION_NAME = r\"{os.path.abspath(os.path.join(output_dir, 'bvh', 'realtime_output.bvh'))}\"")
+    print(f"   VIDEO_NAME = r\"{os.path.abspath(os.path.join(output_dir, 'realtime_output.mp4'))}\"")
+    print("\n3. Run the script in Blender (Alt+P) to render the video")
     print("="*60)
     
     print("\nTest complete!")
