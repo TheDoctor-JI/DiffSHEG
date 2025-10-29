@@ -348,6 +348,14 @@ def main():
     
     # Initialize wrapper
     print("Initializing realtime wrapper...")
+    
+    # Enable non-streaming sanity check mode
+    print("="*60)
+    print("ENABLING NON_STREAMING_SANITY_CHECK MODE")
+    print("This will wait for full audio before generating")
+    print("="*60)
+    DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
+    
     wrapper = DiffSHEGRealtimeWrapper(
         diffsheg_model=trainer,
         opt=opt,
@@ -403,11 +411,17 @@ def main():
     print(f"\nAll chunks sent in {elapsed:.2f}s")
     
     # Wait for processing to complete
-    print("\nWaiting for gesture generation and playback to complete...")
-    # Wait for audio duration + cleanup timeout
-    wait_time = audio_duration + wrapper.cleanup_timeout + 1.0
-    print(f"Waiting {wait_time:.1f}s...")
-    time.sleep(wait_time)
+    if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK:
+        print("\n[SANITY CHECK MODE] Waiting for audio completion and generation...")
+        # Wait for sanity check to complete
+        wrapper.sanity_check_generation_complete.wait(timeout=60.0)
+        print("[SANITY CHECK MODE] Generation complete!")
+    else:
+        print("\nWaiting for gesture generation and playback to complete...")
+        # Wait for audio duration + cleanup timeout
+        wait_time = audio_duration + wrapper.cleanup_timeout + 1.0
+        print(f"Waiting {wait_time:.1f}s...")
+        time.sleep(wait_time)
     
     # Stop wrapper
     print("\nStopping wrapper...")

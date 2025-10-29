@@ -191,7 +191,15 @@ class DiffSHEGRealtimeWrapper:
     - Schedules gesture generation with configurable start margin
     - Manages two threads: playback monitoring and gesture generation
     - Generation thread uses snapshot-based approach for lock-free inference
+    
+    NON_STREAMING_SANITY_CHECK mode:
+    - When enabled, waits for full audio before generating
+    - Uses full audio context for all windows (not just up to window end)
+    - Useful for debugging and comparing with official offline generation
     """
+    
+    # Global flag for non-streaming sanity check mode
+    NON_STREAMING_SANITY_CHECK = False
     
     def __init__(
         self,
@@ -293,6 +301,11 @@ class DiffSHEGRealtimeWrapper:
         self.running = False
         self.playback_managing_thread: Optional[threading.Thread] = None
         self.generation_thread: Optional[threading.Thread] = None
+        self.sanity_check_thread: Optional[threading.Thread] = None
+        
+        # Sanity check mode state
+        self.sanity_check_audio_complete = threading.Event()
+        self.sanity_check_generation_complete = threading.Event()
         
         # DiffSHEG configuration
         self.window_size = opt.n_poses  # e.g., 34 frames
@@ -343,16 +356,31 @@ class DiffSHEGRealtimeWrapper:
     def start(self):
         """Start the wrapper threads."""
         self.running = True
-        self.playback_managing_thread = threading.Thread(target=self._playback_managing_loop, daemon=True)
-        self.generation_thread = threading.Thread(target=self._generation_loop, daemon=True)
-        self.playback_managing_thread.start()
-        self.generation_thread.start()
-        self.logger.info("Playback managing and generation threads started")
+        
+        if self.NON_STREAMING_SANITY_CHECK:
+            # Sanity check mode: monitor audio completion, then generate all at once
+            self.sanity_check_thread = threading.Thread(target=self._sanity_check_loop, daemon=True)
+            self.sanity_check_thread.start()
+            self.logger.info("NON_STREAMING_SANITY_CHECK mode enabled - waiting for full audio before generation")
+        else:
+            # Normal streaming mode
+            self.playback_managing_thread = threading.Thread(target=self._playback_managing_loop, daemon=True)
+            self.generation_thread = threading.Thread(target=self._generation_loop, daemon=True)
+            self.playback_managing_thread.start()
+            self.generation_thread.start()
+            self.logger.info("Playback managing and generation threads started")
         
     def stop(self):
         """Stop the wrapper threads."""
         self.logger.info("Stopping wrapper threads...")
         self.running = False
+        
+        # Set events to unblock any waiting threads
+        self.sanity_check_audio_complete.set()
+        self.sanity_check_generation_complete.set()
+        
+        if self.sanity_check_thread:
+            self.sanity_check_thread.join(timeout=5.0)
         if self.playback_managing_thread:
             self.playback_managing_thread.join(timeout=2.0)
         if self.generation_thread:
@@ -570,6 +598,141 @@ class DiffSHEGRealtimeWrapper:
     
 
     '''
+    Sanity check mode: Non-streaming batch generation
+    '''
+    
+    def _sanity_check_loop(self):
+        """
+        Sanity check thread: Wait for all audio, then generate all waypoints at once.
+        
+        This mode tests the generation logic in a non-streaming setting, similar to
+        the official offline generation. It helps isolate whether issues are due to
+        the core generation or the streaming/windowing approach.
+        
+        Process:
+        1. Monitor audio chunks and wait for completion (no new chunks for threshold)
+        2. Generate all windows using FULL audio context (not limited to window end)
+        3. Execute all waypoints through callback for saving/visualization
+        """
+        audio_complete_threshold = 0.5  # Wait 500ms after last chunk
+        
+        while self.running:
+            time.sleep(0.1)  # 100ms tick
+            
+            # Wait for audio to start arriving
+            with self.utterance_lock:
+                utterance = self.current_utterance
+                if utterance is None or utterance.start_time is None:
+                    continue
+            
+            # Monitor for audio completion
+            while self.running:
+                time.sleep(0.05)
+                
+                with self.utterance_lock:
+                    utterance = self.current_utterance
+                    if utterance is None:
+                        break
+                    
+                    # Check if we've stopped receiving chunks
+                    if utterance.last_chunk_received_time is not None:
+                        time_since_last_chunk = time.time() - utterance.last_chunk_received_time
+                        if time_since_last_chunk >= audio_complete_threshold:
+                            # Audio is complete!
+                            utterance_id = utterance.utterance_id
+                            total_samples = utterance.get_total_samples()
+                            audio_duration = total_samples / utterance.sample_rate
+                            
+                            self.logger.info(
+                                f"[SANITY CHECK] Utterance {utterance_id} audio complete: "
+                                f"{total_samples} samples ({audio_duration:.2f}s)"
+                            )
+                            
+                            # Signal that audio is complete
+                            self.sanity_check_audio_complete.set()
+                            break
+            
+            # Now generate all windows using FULL audio
+            if self.sanity_check_audio_complete.is_set():
+                self.logger.info("[SANITY CHECK] Starting full-audio generation...")
+                self._sanity_check_generate_all()
+                # Signal completion AFTER all waypoints have been executed
+                self.logger.info("[SANITY CHECK] Signaling generation complete")
+                self.sanity_check_generation_complete.set()
+                break
+    
+    def _sanity_check_generate_all(self):
+        """Generate all windows for the current utterance using full audio context."""
+        with self.utterance_lock:
+            utterance = self.current_utterance
+            if utterance is None:
+                return
+            
+            utterance_id = utterance.utterance_id
+            total_samples = utterance.get_total_samples()
+            sample_rate = utterance.sample_rate
+            gesture_fps = utterance.gesture_fps
+            
+            # Get FULL audio
+            full_audio_bytes = utterance.get_audio_window(0, total_samples)
+            
+            self.logger.info(
+                f"[SANITY CHECK] Generating all windows for utterance {utterance_id}: "
+                f"total_samples={total_samples}, duration={total_samples/sample_rate:.2f}s"
+            )
+        
+        # Generate all windows
+        all_waypoints = []
+        overlap_context = None
+        
+        window_start_sample = 0
+        window_end_sample = int((self.window_size / gesture_fps) * sample_rate)
+        
+        window_idx = 0
+        while window_start_sample < total_samples:
+            self.logger.info(
+                f"[SANITY CHECK] Generating window {window_idx}: "
+                f"samples [{window_start_sample}-{window_end_sample}]"
+            )
+            
+            # Generate this window using FULL audio
+            waypoints = self._generate_gesture_window_from_audio(
+                full_audio_bytes,  # CRITICAL: Pass full audio, not windowed
+                window_start_sample,
+                min(window_end_sample, total_samples),
+                sample_rate,
+                gesture_fps,
+                overlap_context,
+                utterance_id
+            )
+            
+            all_waypoints.extend(waypoints)
+            
+            # Update overlap context for next window
+            if waypoints and self.overlap_len > 0:
+                # Get last overlap_len waypoints as context for next window
+                overlap_context = [wp.gesture_data.copy() for wp in waypoints[-self.overlap_len:]]
+            
+            # Advance window
+            window_start_sample += int((self.window_step / gesture_fps) * sample_rate)
+            window_end_sample = window_start_sample + int((self.window_size / gesture_fps) * sample_rate)
+            window_idx += 1
+        
+        self.logger.info(
+            f"[SANITY CHECK] Generated {len(all_waypoints)} total waypoints "
+            f"from {window_idx} windows"
+        )
+        
+        # Execute all waypoints through callback BEFORE signaling completion
+        if self.waypoint_callback is not None:
+            self.logger.info("[SANITY CHECK] Executing all waypoints through callback...")
+            for waypoint in all_waypoints:
+                self.waypoint_callback(waypoint)
+            self.logger.info("[SANITY CHECK] All waypoints executed")
+        else:
+            self.logger.warning("[SANITY CHECK] No waypoint callback provided, waypoints not executed")
+
+    '''
     Gesture generation scheduling
     '''
 
@@ -761,7 +924,12 @@ class DiffSHEGRealtimeWrapper:
         audio_float: np.ndarray,
         sample_rate: int,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Compute mel and optional HuBERT features for the full audio context."""
+        """
+        Compute mel and optional HuBERT features for the full audio context.
+        
+        In NON_STREAMING_SANITY_CHECK mode, this always uses the FULL audio passed in.
+        In streaming mode, this uses audio from 0 to current window end.
+        """
         if audio_float.size == 0:
             return None, None
 
@@ -942,6 +1110,18 @@ class DiffSHEGRealtimeWrapper:
             )
         
         outputs_np = outputs.cpu().numpy()[0]  # Shape: (window_size, C)
+        
+        # === DIAGNOSTIC LOGGING ===
+        outputs_min = outputs_np.min()
+        outputs_max = outputs_np.max()
+        outputs_mean = outputs_np.mean()
+        outputs_std = outputs_np.std()
+        self.logger.info(
+            f"Utterance {utterance_id} window {window_start_frame} model output stats: "
+            f"min={outputs_min:.3f}, max={outputs_max:.3f}, "
+            f"mean={outputs_mean:.3f}, std={outputs_std:.3f}, "
+            f"has_inpaint={len(inpaint_dict)>0}"
+        )
         
         # Create waypoints from the generated gestures
         # Only create waypoints for the non-overlapping part (window_step frames)
