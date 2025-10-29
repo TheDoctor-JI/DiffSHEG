@@ -196,10 +196,11 @@ class DiffSHEGRealtimeWrapper:
         self,
         diffsheg_model,
         opt,
-        default_start_margin: float = 0.5,  # Time offset from utterance start to begin gesture generation
-        audio_sr: int = 16000,
-        device: str = "cuda:0",
-        cleanup_timeout: float = 2.0  # Seconds after playback ends to auto-cleanup
+        config: dict = None,
+        default_start_margin: float = None,
+        audio_sr: int = None,
+        device: str = None,
+        cleanup_timeout: float = None
     ):
         """
         Initialize the wrapper.
@@ -207,21 +208,39 @@ class DiffSHEGRealtimeWrapper:
         Args:
             diffsheg_model: The DiffSHEG trainer instance (DDPMTrainer_beat)
             opt: Configuration options
+            config: Configuration dictionary (typically from YAML). If provided, will be used
+                   for default values. Individual parameters override config values.
             default_start_margin: Time offset (in seconds) from utterance start where gesture 
-                                 generation begins. For example, if start_margin=0.5, the first
-                                 generation window will start at 0.5s into the utterance.
-                                 This ensures gestures are ready before playback needs them,
-                                 since generation is faster than realtime.
-            audio_sr: Audio sample rate
-            device: Computing device
-            cleanup_timeout: Seconds to wait after playback ends before auto-cleanup
+                                 generation begins. If None, reads from config or uses 0.5.
+            audio_sr: Audio sample rate. If None, reads from config or uses 16000.
+            device: Computing device. If None, reads from config or uses opt.device.
+            cleanup_timeout: Seconds to wait after playback ends before auto-cleanup.
+                           If None, reads from config or uses 2.0.
         """
         self.model = diffsheg_model
         self.opt = opt
-        self.default_start_margin = default_start_margin
-        self.audio_sr = audio_sr
-        self.device = device
-        self.cleanup_timeout = cleanup_timeout
+        self.config = config or {}
+        
+        # Get co_speech_gestures config section
+        gesture_config = self.config.get('co_speech_gestures', {})
+        
+        # Load parameters with priority: explicit parameter > config > default
+        self.default_start_margin = (
+            default_start_margin if default_start_margin is not None 
+            else gesture_config.get('start_margin', 0.5)
+        )
+        self.audio_sr = (
+            audio_sr if audio_sr is not None
+            else gesture_config.get('audio_sr', 16000)
+        )
+        self.device = (
+            device if device is not None
+            else gesture_config.get('gpu_device', str(opt.device))
+        )
+        self.cleanup_timeout = (
+            cleanup_timeout if cleanup_timeout is not None
+            else gesture_config.get('cleanup_timeout', 2.0)
+        )
         
         # Initialize logger
         self.logger = setup_logger(
