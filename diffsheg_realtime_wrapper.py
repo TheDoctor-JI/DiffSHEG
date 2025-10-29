@@ -177,6 +177,9 @@ class GestureWaypoints:
             
             return None
     
+    def get_total_waypoints(self):
+        with self.lock:
+            return len(self.waypoints)
 
 class DiffSHEGRealtimeWrapper:
     """
@@ -627,11 +630,12 @@ class DiffSHEGRealtimeWrapper:
         """
         with torch.no_grad():
             # Process audio through Wav2Vec2 processor
+            # Keep input_values as [1, T] shape (don't squeeze)
             input_values_all = self.wav2vec2_processor(
                 speech_tensor.cpu().numpy().squeeze(0),
                 return_tensors="pt",
                 sampling_rate=16000
-            ).input_values.squeeze(0)
+            ).input_values  # [1, T]
             input_values_all = input_values_all.to(self.device)
             
             # For long audio, process in chunks to avoid memory issues

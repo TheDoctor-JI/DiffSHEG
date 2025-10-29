@@ -178,7 +178,7 @@ def main():
     wrapper = DiffSHEGRealtimeWrapper(
         diffsheg_model=trainer,
         opt=opt,
-        default_start_margin=0.5,  # 0.5s margin
+        default_start_margin=2.5,  # 0.5s margin
         audio_sr=16000,  # From config
         device=opt.device,
         cleanup_timeout=2.0
@@ -204,7 +204,7 @@ def main():
     
     # Stream chunks faster than realtime
     utterance_id = 1
-    playback_speed = 2.0  # 2x faster than realtime
+    playback_speed = 5.0  # faster than realtime
     chunk_interval = chunk_duration / playback_speed
     
     print(f"\nStreaming chunks at {playback_speed}x speed (chunk every {chunk_interval:.3f}s)...")
