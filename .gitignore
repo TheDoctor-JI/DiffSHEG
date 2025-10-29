@@ -17,8 +17,6 @@ train.sh
 videos
 rebuttal
 
-test*
-
 ## BEAT_ori
 0_BEAT_ori/outputs/*
 0_BEAT_ori/datasets
