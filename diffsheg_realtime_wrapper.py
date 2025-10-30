@@ -1138,66 +1138,29 @@ class DiffSHEGRealtimeWrapper:
                     self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{utterance.next_window_start_sample}-{utterance.next_window_end_sample}] (step={utterance.next_window_start_sample - (prev_window_end - (utterance.next_window_end_sample - utterance.next_window_start_sample))} samples)")
 
     
-    def _get_hubert_from_16k_speech(self, speech_tensor):
+    def _get_hubert_from_16k_speech(self, speech_array):
         """
-        Extract HuBERT features from 16kHz audio.
+        Extract HuBERT features from 16kHz audio using the official function.
         
         Args:
-            speech_tensor: Audio tensor of shape [1, T] at 16kHz
+            speech_array: Audio numpy array of shape [T] at 16kHz (1D, NOT tensor)
             
         Returns:
-            HuBERT features of shape [T_hubert, 1024]
+            HuBERT features of shape [T_hubert, 1024] (torch.Tensor on CPU)
         """
+        # Use the official function imported from trainers.ddpm_beat_trainer
+        if get_hubert_from_16k_speech_long is None:
+            self.logger.error("get_hubert_from_16k_speech_long not available")
+            return None
+        
         with torch.no_grad():
-            # Process audio through Wav2Vec2 processor
-            # Keep input_values as [1, T] shape (don't squeeze)
-            input_values_all = self.wav2vec2_processor(
-                speech_tensor.cpu().numpy().squeeze(0),
-                return_tensors="pt",
-                sampling_rate=16000
-            ).input_values  # [1, T]
-            input_values_all = input_values_all.to(self.device)
-            
-            # For long audio, process in chunks to avoid memory issues
-            # HuBERT uses CNN with stride 320 and kernel 400
-            kernel = 400
-            stride = 320
-            clip_length = stride * 1000
-            num_iter = input_values_all.shape[1] // clip_length
-            expected_T = (input_values_all.shape[1] - (kernel - stride)) // stride
-            
-            res_lst = []
-            for i in range(num_iter):
-                if i == 0:
-                    start_idx = 0
-                    end_idx = clip_length - stride + kernel
-                else:
-                    start_idx = clip_length * i
-                    end_idx = start_idx + (clip_length - stride + kernel)
-                
-                input_values = input_values_all[:, start_idx:end_idx]
-                hidden_states = self.hubert_model(input_values).last_hidden_state
-                res_lst.append(hidden_states[0])
-            
-            # Process remaining audio
-            if num_iter > 0:
-                input_values = input_values_all[:, clip_length * num_iter:]
-            else:
-                input_values = input_values_all
-            
-            if input_values.shape[1] >= kernel:
-                hidden_states = self.hubert_model(input_values).last_hidden_state
-                res_lst.append(hidden_states[0])
-            
-            ret = torch.cat(res_lst, dim=0)  # [T, 1024]
-            
-            # Pad or trim to expected length
-            if ret.shape[0] < expected_T:
-                ret = torch.nn.functional.pad(ret, (0, 0, 0, expected_T - ret.shape[0]))
-            else:
-                ret = ret[:expected_T]
-            
-            return ret
+            # Official function expects numpy array, not tensor
+            return get_hubert_from_16k_speech_long(
+                self.hubert_model,
+                self.wav2vec2_processor,
+                speech_array,  # Pass numpy array directly
+                device=self.device
+            )
 
     def _compute_full_audio_features(
         self,
@@ -1255,16 +1218,20 @@ class DiffSHEGRealtimeWrapper:
 
         hubert_feat_full: Optional[torch.Tensor] = None
         if self.use_hubert and self.hubert_model is not None:
-            audio_16k = torch.from_numpy(raw_audio).unsqueeze(0).to(self.device)
-            hubert_feat_full = self._get_hubert_from_16k_speech(audio_16k)
-            hubert_feat_full = hubert_feat_full.swapaxes(-1, -2).unsqueeze(0)
-            hubert_feat_full = F.interpolate(
-                hubert_feat_full,
-                size=audio_emb_full.shape[1],
-                mode="linear",
-                align_corners=True,
-            )
-            hubert_feat_full = hubert_feat_full.swapaxes(-1, -2)
+            # Official function expects numpy array (1D)
+            hubert_feat_full = self._get_hubert_from_16k_speech(raw_audio)
+            if hubert_feat_full is not None:
+                # hubert_feat_full is on CPU, shape [T_hubert, 1024]
+                # Move to device and reshape for interpolation
+                hubert_feat_full = hubert_feat_full.to(self.device)
+                hubert_feat_full = hubert_feat_full.swapaxes(-1, -2).unsqueeze(0)  # [1, 1024, T_hubert]
+                hubert_feat_full = F.interpolate(
+                    hubert_feat_full,
+                    size=audio_emb_full.shape[1],
+                    mode="linear",
+                    align_corners=True,
+                )
+                hubert_feat_full = hubert_feat_full.swapaxes(-1, -2)  # [1, T_mel, 1024]
 
         return audio_emb_full.float(), None if hubert_feat_full is None else hubert_feat_full.float()
 
@@ -1387,17 +1354,18 @@ class DiffSHEGRealtimeWrapper:
             prev_frames_np = np.stack(overlap_context).astype(np.float32)
             prev_frames = torch.from_numpy(prev_frames_np).unsqueeze(0).to(self.device)
             inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames
-        elif window_start_frame == 0:
-            # === FIX: Explicitly condition the first frame of the first window on a neutral pose ===
-            # For the very first window, we don't have an overlap context.
-            # We condition the model by providing a neutral pose (zeros in normalized space)
-            # for the first frame to prevent it from starting in a random, potentially unstable state.
-            self.logger.debug(f"Utterance {utterance_id}: First window. Inpainting first frame with neutral pose.")
+        elif window_start_frame == 0 and self.opt.fix_very_first:
+            # === FIX: Match official behavior for the very first window ===
+            # When opt.fix_very_first is True, the official code conditions the first overlap_len frames
+            # on neutral pose (zeros in normalized space) to prevent random initialization and reduce jitter.
+            # See official test_custom_aud() around line 1290-1295 in ddpm_beat_trainer.py
+            self.logger.debug(f"Utterance {utterance_id}: First window with fix_very_first=True. "
+                             f"Conditioning first {self.overlap_len} frames on neutral pose.")
             inpaint_dict['gt'] = motions.new_zeros(motions.shape)
             inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
-            # Set the first frame of the ground truth to zeros (neutral) and mask it for inpainting.
-            inpaint_dict['gt'][:, 0, :] = 0
-            inpaint_dict['outpainting_mask'][:, 0, :] = True
+            # Condition the first overlap_len frames on neutral pose (all zeros)
+            inpaint_dict['gt'][:, :self.overlap_len, :] = 0
+            inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
         
         # Generate gestures (no lock held during model inference)
         with torch.no_grad():
