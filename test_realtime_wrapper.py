@@ -1,5 +1,28 @@
 """
 Test script for DiffSHEG Realtime Wrapper
+
+TESTING MODES:
+==============
+
+1. STREAMING MODE (default):
+   - DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = False
+   - Generates gestures in real-time as audio chunks arrive
+   - Uses incremental windowing approach
+   
+2. NON-STREAMING SANITY CHECK MODE:
+   - DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
+   - DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = False
+   - Waits for complete audio before generating
+   - Uses wrapper's own generation code (_compute_full_audio_features, _generate_gesture_window_from_audio)
+   - Useful for debugging wrapper's generation logic without streaming complexity
+   
+3. REFERENCE PIPELINE MODE (best for debugging):
+   - DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
+   - DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = True
+   - Uses EXACT same code as official runner.py test_custom_aud()
+   - Bypasses ALL wrapper-specific generation code
+   - Should produce IDENTICAL output to official runner
+   - If output differs from official runner, the issue is in waypoint conversion/saving
 """
 import os
 import sys
@@ -406,9 +429,16 @@ def main():
     
     # Enable non-streaming sanity check mode
     DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
+    
+    # Enable reference pipeline mode (uses exact same code as official runner.py)
+    DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = True
+    
     print("="*60)
     print(f"{'ENABLING' if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK else 'DISABLING'} NON_STREAMING_SANITY_CHECK MODE")
     print("This will wait for full audio before generating")
+    print()
+    print(f"{'ENABLING' if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE else 'DISABLING'} SANITY_CHECK_USE_REFERENCE_PIPELINE MODE")
+    print("This will use the EXACT same code as official runner.py")
     print("="*60)
 
 

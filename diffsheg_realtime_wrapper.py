@@ -3,6 +3,37 @@ DiffSHEG Realtime Wrapper for GPT-4o Dialogue System Integration
 
 This wrapper class manages the integration of DiffSHEG gesture generation with
 a real-time dialogue system that receives audio chunks from GPT-4o-realtime.
+
+TESTING/DEBUGGING MODES:
+========================
+
+The wrapper supports multiple operating modes via class-level flags:
+
+1. STREAMING MODE (default):
+   - NON_STREAMING_SANITY_CHECK = False
+   - SANITY_CHECK_USE_REFERENCE_PIPELINE = False (ignored)
+   - Real-time gesture generation as audio chunks arrive
+   - Uses incremental windowing with overlap context
+   
+2. NON-STREAMING SANITY CHECK MODE:
+   - NON_STREAMING_SANITY_CHECK = True
+   - SANITY_CHECK_USE_REFERENCE_PIPELINE = False
+   - Waits for complete audio before generating
+   - Uses wrapper's own generation pipeline
+   - Useful for debugging without streaming complexity
+   
+3. REFERENCE PIPELINE MODE (best for comparing with official output):
+   - NON_STREAMING_SANITY_CHECK = True
+   - SANITY_CHECK_USE_REFERENCE_PIPELINE = True
+   - Uses EXACT same code as official runner.py::test_custom_aud()
+   - Bypasses ALL wrapper-specific code (feature extraction, windowing, etc.)
+   - Should produce IDENTICAL results to official runner
+   - If output still differs, issue is in waypoint conversion/saving logic
+
+To enable these modes, set the flags BEFORE creating the wrapper:
+    DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
+    DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = True
+    wrapper = DiffSHEGRealtimeWrapper(...)
 """
 
 import threading
@@ -21,6 +52,12 @@ import librosa
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger.logger import setup_logger
+
+# Import for reference pipeline (only needed when SANITY_CHECK_USE_REFERENCE_PIPELINE is enabled)
+try:
+    from trainers.ddpm_beat_trainer import get_hubert_from_16k_speech_long
+except ImportError:
+    get_hubert_from_16k_speech_long = None
 
 
 class Utterance:
@@ -196,10 +233,17 @@ class DiffSHEGRealtimeWrapper:
     - When enabled, waits for full audio before generating
     - Uses full audio context for all windows (not just up to window end)
     - Useful for debugging and comparing with official offline generation
+    
+    SANITY_CHECK_USE_REFERENCE_PIPELINE mode:
+    - When enabled together with NON_STREAMING_SANITY_CHECK, uses the exact
+      same code as the official runner.py test_custom_aud() method
+    - Bypasses all wrapper-specific generation code
+    - Should produce identical output to official runner for comparison
     """
     
-    # Global flag for non-streaming sanity check mode
+    # Global flags for sanity check modes
     NON_STREAMING_SANITY_CHECK = False
+    SANITY_CHECK_USE_REFERENCE_PIPELINE = False
     
     def __init__(
         self,
@@ -334,6 +378,23 @@ class DiffSHEGRealtimeWrapper:
     def start(self):
         """Start the wrapper threads."""
         self.running = True
+        
+        # Log mode information
+        if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK:
+            if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE:
+                self.logger.info("="*60)
+                self.logger.info("SANITY CHECK MODE: REFERENCE PIPELINE")
+                self.logger.info("Using EXACT same code as official runner.py")
+                self.logger.info("="*60)
+            else:
+                self.logger.info("="*60)
+                self.logger.info("SANITY CHECK MODE: NON-STREAMING")
+                self.logger.info("Using wrapper's own generation pipeline")
+                self.logger.info("="*60)
+        else:
+            self.logger.info("="*60)
+            self.logger.info("STREAMING MODE: Real-time generation")
+            self.logger.info("="*60)
         
         if self.NON_STREAMING_SANITY_CHECK:
             # Sanity check mode: monitor audio completion, then generate all at once
@@ -641,6 +702,11 @@ class DiffSHEGRealtimeWrapper:
     
     def _sanity_check_generate_all(self):
         """Generate all windows for the current utterance using full audio context."""
+        # Check if we should use reference pipeline
+        if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE:
+            self._sanity_check_reference_pipeline()
+            return
+        
         with self.utterance_lock:
             utterance = self.current_utterance
             if utterance is None:
@@ -710,6 +776,220 @@ class DiffSHEGRealtimeWrapper:
             self.logger.info("[SANITY CHECK] All waypoints executed")
         else:
             self.logger.warning("[SANITY CHECK] No waypoint callback provided, waypoints not executed")
+
+    def _sanity_check_reference_pipeline(self):
+        """
+        Use the EXACT same generation pipeline as the official runner.py test_custom_aud() method.
+        
+        This method is a LINE-BY-LINE replication of the official DiffSHEG inference code from
+        trainers/ddpm_beat_trainer.py::test_custom_aud(). It bypasses ALL wrapper-specific code
+        including:
+        - Wrapper's audio feature extraction (_compute_full_audio_features)
+        - Wrapper's windowed generation (_generate_gesture_window_from_audio)
+        - Wrapper's window management logic
+        
+        Instead, it uses:
+        - Official mel spectrogram extraction
+        - Official HuBERT feature extraction (get_hubert_from_16k_speech_long)
+        - Official window generation logic (get_windows)
+        - Official trainer.generate_batch() method
+        
+        This ensures that any differences between wrapper output and official output can ONLY be
+        due to the waypoint conversion/saving logic, not the generation pipeline itself.
+        
+        Use this when SANITY_CHECK_USE_REFERENCE_PIPELINE flag is True.
+        """
+        self.logger.info("[REFERENCE PIPELINE] Using official runner.py generation pipeline")
+        self.logger.info("[REFERENCE PIPELINE] Bypassing ALL wrapper-specific generation code")
+        
+        with self.utterance_lock:
+            utterance = self.current_utterance
+            if utterance is None:
+                return
+            
+            utterance_id = utterance.utterance_id
+            total_samples = utterance.get_total_samples()
+            sample_rate = utterance.sample_rate
+            
+            # Get full audio as float32 array
+            full_audio_bytes = utterance.get_audio_window(0, total_samples)
+        
+        # Convert bytes to float32 numpy array (same as official runner expects)
+        audio_int16 = np.frombuffer(full_audio_bytes, dtype=np.int16)
+        aud_ori = audio_int16.astype(np.float32) / 32768.0  # Normalize to [-1, 1]
+        
+        self.logger.info(
+            f"[REFERENCE PIPELINE] Loaded audio: shape={aud_ori.shape}, "
+            f"duration={len(aud_ori)/sample_rate:.2f}s"
+        )
+        
+        # ===== EXACT REPLICATION OF OFFICIAL RUNNER.PY =====
+        # This code is copied directly from trainers/ddpm_beat_trainer.py test_custom_aud()
+        
+        trainer = self.model  # This is the DDPMTrainer_beat instance
+        opt = self.opt
+        device = self.device
+        
+        # Resample to 18000Hz for mel spectrogram (official pipeline)
+        aud = librosa.resample(aud_ori, orig_sr=sample_rate, target_sr=18000)
+        
+        # Extract mel spectrogram
+        self.logger.info("[REFERENCE PIPELINE] Extracting mel spectrogram...")
+        mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
+        mel = mel[..., :-1]
+        audio_emb = torch.from_numpy(np.swapaxes(mel, -1, -2))
+        audio_emb = audio_emb.unsqueeze(0).to(device)
+        
+        B, N, _ = audio_emb.shape
+        C = opt.net_dim_pose
+        motions = torch.zeros((B, audio_emb.shape[-2], C)).to(device)
+        
+        # Define get_windows function (from official runner)
+        def get_windows(x, size, step):
+            if isinstance(x, dict):
+                out = {}
+                for key in x.keys():
+                    out[key] = get_windows(x[key], size, step)
+                out_dict_list = []
+                for i in range(len(out[list(out.keys())[0]])):
+                    out_dict_list.append({key: out[key][i] for key in out.keys()})
+                return out_dict_list
+            else:
+                seq_len = x.shape[1]
+                if seq_len <= size:
+                    return [x]
+                else:
+                    win_num = (seq_len - (size-step)) / float(step)
+                    out = [x[:, mm*step : mm*step + size, ...] for mm in range(int(win_num))]
+                    if win_num - int(win_num) != 0:
+                        out.append(x[:, int(win_num)*step:, ...])  
+                    return out
+        
+        # Get windowed audio and motion
+        window_step = opt.n_poses - opt.overlap_len
+        audio_emb_list = get_windows(audio_emb, opt.n_poses, window_step)
+        motions_list = get_windows(motions, opt.n_poses, window_step)
+        
+        # Prepare additional conditioning (HuBERT features)
+        add_cond = {}
+        if opt.expAddHubert or opt.addHubert:
+            self.logger.info("[REFERENCE PIPELINE] Extracting HuBERT features...")
+            
+            # Check if HuBERT models are available
+            if not hasattr(self, 'hubert_model') or not hasattr(self, 'wav2vec2_processor'):
+                self.logger.error("[REFERENCE PIPELINE] HuBERT model not initialized!")
+                # Initialize HuBERT models
+                from transformers import Wav2Vec2Processor, HubertModel
+                self.logger.info("[REFERENCE PIPELINE] Loading HuBERT models...")
+                self.wav2vec2_processor = Wav2Vec2Processor.from_pretrained("facebook/hubert-large-ls960-ft")
+                self.hubert_model = HubertModel.from_pretrained("facebook/hubert-large-ls960-ft")
+                self.hubert_model = self.hubert_model.to(device)
+            
+            add_cond["pretrain_aud_feat"] = get_hubert_from_16k_speech_long(
+                self.hubert_model, 
+                self.wav2vec2_processor, 
+                torch.from_numpy(aud_ori).unsqueeze(0).to(device), 
+                device=device
+            )
+            add_cond["pretrain_aud_feat"] = F.interpolate(
+                add_cond["pretrain_aud_feat"].swapaxes(-1,-2).unsqueeze(0), 
+                size=audio_emb.shape[-2], 
+                mode='linear', 
+                align_corners=True
+            ).swapaxes(-1,-2)
+            
+            # Put dict values into device
+            for key in add_cond.keys():
+                add_cond[key] = add_cond[key].to(device)
+        
+        # Window the conditioning
+        if add_cond not in [None, {}]:
+            add_cond_list = get_windows(add_cond, opt.n_poses, window_step)
+        
+        # Prepare person ID
+        p_id = torch.zeros((1, 1))  # Default to person 0
+        p_id = trainer.one_hot(p_id, opt.speaker_dim).detach().to(device)
+        
+        # Generate motion for each window
+        self.logger.info(f"[REFERENCE PIPELINE] Generating {len(audio_emb_list)} windows...")
+        out_motions = []
+        
+        for ii, (audio_emb_win, motions_win) in enumerate(zip(audio_emb_list, motions_list)):
+            self.logger.info(f"[REFERENCE PIPELINE] Processing window {ii+1}/{len(audio_emb_list)}")
+            
+            if add_cond not in [None, {}]:
+                add_cond_win = add_cond_list[ii]
+            else:
+                add_cond_win = {}
+            
+            # Prepare inpainting dict for overlap
+            inpaint_dict = {}
+            if opt.overlap_len > 0:
+                inpaint_dict['gt'] = torch.zeros_like(motions_win)
+                inpaint_dict['outpainting_mask'] = torch.zeros_like(
+                    motions_win, dtype=torch.bool, device=motions_win.device
+                )
+                
+                if ii == 0:
+                    if opt.fix_very_first:
+                        inpaint_dict['outpainting_mask'][..., :opt.overlap_len, :] = True
+                        inpaint_dict['gt'][:, :opt.overlap_len, ...] = motions_win[:, -opt.overlap_len:, ...]
+                elif ii > 0:
+                    inpaint_dict['outpainting_mask'][..., :opt.overlap_len, :] = True
+                    inpaint_dict['gt'][:, :opt.overlap_len, ...] = outputs[:, -opt.overlap_len:, ...]
+            
+            # Generate using official trainer method
+            outputs = trainer.generate_batch(
+                audio_emb_win, p_id, opt.net_dim_pose, add_cond_win, inpaint_dict
+            )
+            
+            outputs_np = outputs.cpu().numpy()
+            if ii == len(motions_list) - 1:
+                out_motions.append(outputs_np)
+            else:
+                out_motions.append(outputs_np[:, :window_step])
+        
+        # Concatenate all windows
+        out_motions = np.concatenate(out_motions, 1)  # [B, T, C]
+        self.logger.info(f"[REFERENCE PIPELINE] Generated motion: shape={out_motions.shape}")
+        
+        # Split into gesture and expression if needed
+        if opt.unidiffuser or opt.net_dim_pose == 192:
+            out_motions, out_expression = np.split(out_motions, [opt.split_pos], axis=-1)
+            self.logger.info(
+                f"[REFERENCE PIPELINE] Split: gesture={out_motions.shape}, expression={out_expression.shape}"
+            )
+        
+        # Convert to waypoints
+        # out_motions shape: [1, T, C] where T is number of frames
+        all_waypoints = []
+        gesture_fps = self.gesture_fps
+        
+        for frame_idx in range(out_motions.shape[1]):
+            timestamp = frame_idx / gesture_fps
+            gesture_data = out_motions[0, frame_idx, :]  # [C,]
+            
+            waypoint = GestureWaypoint(
+                waypoint_index=frame_idx,
+                timestamp=timestamp,
+                gesture_data=gesture_data
+            )
+            all_waypoints.append(waypoint)
+        
+        self.logger.info(
+            f"[REFERENCE PIPELINE] Created {len(all_waypoints)} waypoints "
+            f"at {gesture_fps} FPS"
+        )
+        
+        # Execute all waypoints through callback
+        if self.waypoint_callback is not None:
+            self.logger.info("[REFERENCE PIPELINE] Executing all waypoints through callback...")
+            for waypoint in all_waypoints:
+                self.waypoint_callback(waypoint)
+                time.sleep(0.01)
+            self.logger.info("[REFERENCE PIPELINE] All waypoints executed")
+        else:
+            self.logger.warning("[REFERENCE PIPELINE] No waypoint callback provided")
 
     '''
     Gesture generation scheduling
