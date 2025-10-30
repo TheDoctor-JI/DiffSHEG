@@ -241,7 +241,7 @@ class DiffSHEGRealtimeWrapper:
     
     # Global flags for constrained feature extraction
     USE_CONSTRAINED_FEATURES = True
-    AUDIO_DUR_FOR_FEATURES = 5.0  # Duration in seconds for constrained audio context
+    AUDIO_DUR_FOR_FEATURES = 10.0  # Duration in seconds for constrained audio context
     
     def __init__(
         self,
@@ -438,7 +438,7 @@ class DiffSHEGRealtimeWrapper:
     '''
 
     def add_audio_chunk(self, utterance_id: int, chunk_index: int, audio_data: list, 
-                        duration: float):
+                        duration: float = None):
         """
         Add a new audio chunk from the dialogue system.
         Playback automatically starts when the first chunk (chunk_index=0) arrives.
@@ -448,7 +448,7 @@ class DiffSHEGRealtimeWrapper:
             utterance_id: Unique identifier for the utterance (msg_idx in your system)
             chunk_index: Position of this chunk within the utterance (starts from 0)
             audio_data: Raw audio data (list of integers)
-            duration: Duration of the chunk in seconds (not used internally, kept for API compatibility)
+            duration: Optional duration of the chunk in seconds (not used internally, kept for API compatibility)
         """
         # Reject chunks for cancelled/timed-out utterances
         if utterance_id in self.cancelled_utterances:
