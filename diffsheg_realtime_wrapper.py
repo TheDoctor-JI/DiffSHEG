@@ -496,9 +496,9 @@ class DiffSHEGRealtimeWrapper:
             
             self.logger.debug(f"Utterance {utterance_id} chunk {chunk_index}: added {audio_samples_after - audio_samples_before} samples (total: {audio_samples_after})")
     
-    def cancel_utterance(self, utterance_id: int):
+    def cancel_utterance(self):
         """
-        Cancel an utterance and discard its audio chunks and generated gestures.
+        Cancel the ongoing utterance and discard its audio chunks and generated gestures.
         
         Since gesture generation is faster than realtime, it's safe to simply
         discard the current utterance and all its waypoints when cancelled.
@@ -507,23 +507,17 @@ class DiffSHEGRealtimeWrapper:
         This also prevents late-arriving chunks for this utterance from being
         processed by tracking cancelled utterance IDs in a set.
         
-        Args:
-            utterance_id: The utterance to cancel (msg_idx in your system)
         """
         with self.utterance_lock:
             # Add to cancelled set to reject any late-arriving chunks
-            self.cancelled_utterances.add(utterance_id)
+            self.cancelled_utterances.add(self.current_utterance.utterance_id)
             
-            # If this is the current utterance, discard it
-            if self.current_utterance and self.current_utterance.utterance_id == utterance_id:
-                # Simply discard everything - generation is faster than realtime
-                # so we can regenerate from scratch for the next utterance
-                total_samples = self.current_utterance.get_total_samples()
-                self.current_utterance = None
-                self.logger.info(f"Utterance {utterance_id} cancelled (had {total_samples} samples)")
-            else:
-                self.logger.info(f"Utterance {utterance_id} marked as cancelled (not current utterance)")
-    
+            # Then, simply discard everything - generation is faster than realtime
+            # so we can regenerate from scratch for the next utterance
+            total_samples = self.current_utterance.get_total_samples()
+            self.logger.info(f"Cancel utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
+            self.current_utterance = None
+
     def _cleanup_current_utterance(self):
         """
         Internal cleanup method called automatically by playback managing thread.
