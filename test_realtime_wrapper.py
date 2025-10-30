@@ -662,7 +662,7 @@ def main():
     DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
     
     # Enable reference pipeline mode (uses exact same code as official runner.py)
-    DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = True
+    DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = False
     
     # Enable using the same export logic as official runner.py
     # When True, bypasses WaypointCollector and uses trainer's export methods directly
