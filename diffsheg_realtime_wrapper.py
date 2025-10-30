@@ -351,6 +351,9 @@ class DiffSHEGRealtimeWrapper:
         self.sanity_check_audio_complete = threading.Event()
         self.sanity_check_generation_complete = threading.Event()
         
+        # Store last generated motion (for avoiding regeneration during export)
+        self.last_generated_motion = None
+        
         # DiffSHEG configuration
         self.window_size = opt.n_poses  # e.g., 34 frames
         self.overlap_len = opt.overlap_len  # e.g., 4 frames
@@ -952,6 +955,10 @@ class DiffSHEGRealtimeWrapper:
         # Concatenate all windows
         out_motions = np.concatenate(out_motions, 1)  # [B, T, C]
         self.logger.info(f"[REFERENCE PIPELINE] Generated motion: shape={out_motions.shape}")
+        
+        # Store the generated motion for optional export (avoids regeneration)
+        self.last_generated_motion = torch.from_numpy(out_motions)
+        self.logger.info("[REFERENCE PIPELINE] Stored generated motion for export")
         
         # NOTE: Keep gesture and expression COMBINED for waypoints
         # The WaypointCollector will handle splitting when saving to files

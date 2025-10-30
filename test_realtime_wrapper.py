@@ -16,13 +16,31 @@ TESTING MODES:
    - Uses wrapper's own generation code (_compute_full_audio_features, _generate_gesture_window_from_audio)
    - Useful for debugging wrapper's generation logic without streaming complexity
    
-3. REFERENCE PIPELINE MODE (best for debugging):
+3. REFERENCE PIPELINE MODE (for debugging generation):
    - DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
    - DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = True
-   - Uses EXACT same code as official runner.py test_custom_aud()
+   - Uses EXACT same code as official runner.py test_custom_aud() for generation
    - Bypasses ALL wrapper-specific generation code
    - Should produce IDENTICAL output to official runner
-   - If output differs from official runner, the issue is in waypoint conversion/saving
+   - If output differs, the issue is in waypoint conversion/export or streaming logic
+
+4. REFERENCE EXPORT MODE (for debugging export):
+   - USE_SAME_EXPORT = True
+   - Uses EXACT same export logic as official runner.py test_custom_aud()
+   - Bypasses WaypointCollector export logic
+   - Should produce IDENTICAL visualization to official runner
+   - If output differs with this enabled, the issue is NOT in export logic
+   
+DEBUGGING WORKFLOW:
+===================
+To isolate the issue:
+1. Set SANITY_CHECK_USE_REFERENCE_PIPELINE = True and USE_SAME_EXPORT = True
+   → If output looks normal: Issue is in wrapper's generation or export
+2. Set SANITY_CHECK_USE_REFERENCE_PIPELINE = True and USE_SAME_EXPORT = False  
+   → If output looks normal now: Issue is in WaypointCollector export logic
+   → If output still broken: Issue is in wrapper's generation logic
+3. Set SANITY_CHECK_USE_REFERENCE_PIPELINE = False
+   → Issue is in wrapper's generation pipeline (feature extraction, windowing, etc.)
 """
 import os
 import sys
@@ -42,6 +60,9 @@ from models import MotionTransformer, UniDiffuser
 from trainers import DDPMTrainer_beat
 from diffsheg_realtime_wrapper import DiffSHEGRealtimeWrapper
 import datasets.rotation_converter as rot_cvt
+import torch.nn.functional as F
+from trainers.ddpm_beat_trainer import get_hubert_from_16k_speech_long
+from transformers import Wav2Vec2Processor, HubertModel
 
 
 class WaypointCollector:
@@ -364,6 +385,213 @@ def audio_to_chunks(audio, sr, chunk_duration=0.04):
     return chunks
 
 
+def official_export_logic(audio_path, trainer, opt, output_dir, pre_generated_motion=None):
+    """
+    Use the EXACT same export logic as runner.py test_custom_aud().
+    
+    Args:
+        audio_path: Path to the audio file
+        trainer: DDPMTrainer_beat instance
+        opt: Options/config object
+        output_dir: Output directory for results
+        pre_generated_motion: Optional pre-generated motion tensor (B, T, 192) to skip generation.
+                             If provided, only the export logic is used (conversion + saving).
+                             If None, full generation pipeline is run.
+    """
+    print("\n[OFFICIAL EXPORT] Using exact same export logic as runner.py...")
+    
+    # Get audio name for later use
+    name = os.path.basename(audio_path)
+    
+    if pre_generated_motion is None:
+        # Full generation pipeline
+        print("[OFFICIAL EXPORT] No pre-generated motion provided, running full generation...")
+        
+        # Load HuBERT models (required for addHubert=True)
+        print("[OFFICIAL EXPORT] Loading HuBERT models...")
+        wav2vec2_processor = Wav2Vec2Processor.from_pretrained("facebook/hubert-large-ls960-ft")
+        hubert_model = HubertModel.from_pretrained("facebook/hubert-large-ls960-ft")
+        hubert_model = hubert_model.to(opt.device)
+        
+        # Person ID (use speaker 2 like in the official script)
+        p_id_ori = 2
+        p_id = p_id_ori - 1
+        p_id_tensor = torch.ones((1, 1)) * p_id
+        p_id_tensor = trainer.one_hot(p_id_tensor, opt.speaker_dim).detach().to(opt.device)
+        
+        # Load audio
+        sr = 16000
+        print(f"[OFFICIAL EXPORT] Loading audio: {name}")
+        
+        if name.endswith(".wav"):
+            aud_ori, sr = librosa.load(audio_path)
+        elif name.endswith(".npy"):
+            aud_ori = np.load(audio_path)
+        
+        # Resample for mel spectrogram
+        aud = librosa.resample(aud_ori, orig_sr=sr, target_sr=18000)
+        
+        # Extract mel spectrogram features (same as official runner)
+        mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
+        mel = mel[..., :-1]
+        audio_emb = torch.from_numpy(np.swapaxes(mel, -1, -2))
+        audio_emb = audio_emb.unsqueeze(0).to(opt.device)
+        
+        B, N, _ = audio_emb.shape
+        C = opt.net_dim_pose
+        motions = torch.zeros((B, audio_emb.shape[-2], C)).to(opt.device)
+        
+        # Window generation (same as official runner)
+        def get_windows(x, size, step):
+            if isinstance(x, dict):
+                out = {}
+                for key in x.keys():
+                    out[key] = get_windows(x[key], size, step)
+                out_dict_list = []
+                for i in range(len(out[list(out.keys())[0]])):
+                    out_dict_list.append({key: out[key][i] for key in out.keys()})
+                return out_dict_list
+            else:
+                seq_len = x.shape[1]
+                if seq_len <= size:
+                    return [x]
+                else:
+                    win_num = (seq_len - (size-step)) / float(step)
+                    out = [x[:, mm*step : mm*step + size, ...] for mm in range(int(win_num))]
+                    if win_num - int(win_num) != 0:
+                        out.append(x[:, int(win_num)*step:, ...])  
+                    return out
+        
+        window_step = opt.n_poses - opt.overlap_len
+        audio_emb_list = get_windows(audio_emb, opt.n_poses, window_step)
+        motions_list = get_windows(motions, opt.n_poses, window_step)
+        
+        # Add HuBERT features (same as official runner)
+        add_cond = {}
+        print("[OFFICIAL EXPORT] Extracting HuBERT features...")
+        add_cond["pretrain_aud_feat"] = get_hubert_from_16k_speech_long(
+            hubert_model, wav2vec2_processor, 
+            torch.from_numpy(aud_ori).unsqueeze(0).to(opt.device), 
+            device=opt.device
+        )
+        add_cond["pretrain_aud_feat"] = F.interpolate(
+            add_cond["pretrain_aud_feat"].swapaxes(-1,-2).unsqueeze(0), 
+            size=audio_emb.shape[-2], 
+            mode='linear', 
+            align_corners=True
+        ).swapaxes(-1,-2)
+        
+        # Put dict values into device
+        if isinstance(add_cond, dict):
+            for key in add_cond.keys():
+                add_cond[key] = add_cond[key].to(opt.device)
+        
+        if add_cond not in [None, {}]:
+            add_cond_list = get_windows(add_cond, opt.n_poses, window_step)
+        
+        # Generate motion for each window (same as official runner)
+        out_motions = []
+        print(f"[OFFICIAL EXPORT] Generating motion for {len(audio_emb_list)} windows...")
+        for ii, [audio_emb_win, motions_win] in enumerate(zip(audio_emb_list, motions_list)):
+            print(f"[OFFICIAL EXPORT] Window {ii+1}/{len(audio_emb_list)}")
+            
+            if add_cond not in [None, {}]:
+                add_cond_win = add_cond_list[ii]
+            
+            inpaint_dict = {}
+            if opt.overlap_len > 0:
+                inpaint_dict['gt'] = torch.zeros_like(motions_win)
+                inpaint_dict['outpainting_mask'] = torch.zeros_like(
+                    motions_win, dtype=torch.bool, device=motions_win.device
+                )
+                
+                if ii == 0:
+                    if opt.fix_very_first:
+                        inpaint_dict['outpainting_mask'][..., :opt.overlap_len, :] = True
+                        inpaint_dict['gt'][:, :opt.overlap_len, ...] = motions_win[:, -opt.overlap_len:, ...]
+                    else:
+                        pass
+                elif ii > 0:
+                    inpaint_dict['outpainting_mask'][..., :opt.overlap_len, :] = True
+                    inpaint_dict['gt'][:, :opt.overlap_len, ...] = outputs[:, -opt.overlap_len:, ...]
+            
+            outputs = trainer.generate_batch(
+                audio_emb_win, p_id_tensor, opt.net_dim_pose, add_cond_win, inpaint_dict
+            )
+            
+            outputs_np = outputs.cpu().numpy()
+            if ii == len(motions_list) - 1:
+                out_motions.append(outputs_np)
+            else:
+                out_motions.append(outputs_np[:, :window_step])
+        
+        # Concatenate all windows
+        out_motions = np.concatenate(out_motions, 1)
+        print(f"[OFFICIAL EXPORT] Total frames: {out_motions.shape[1]}")
+    else:
+        # Use pre-generated motion
+        print("[OFFICIAL EXPORT] Using pre-generated motion from wrapper...")
+        out_motions = pre_generated_motion.cpu().numpy()
+        print(f"[OFFICIAL EXPORT] Pre-generated motion shape: {out_motions.shape}")
+    
+    # Split gesture and expression (same as official runner)
+    if opt.unidiffuser or opt.net_dim_pose == 192:
+        out_motions, out_expression = np.split(out_motions, [opt.split_pos], axis=-1)
+    
+    # Handle axis-angle to Euler conversion (same as official runner)
+    if opt.axis_angle:
+        # Load normalization stats
+        mean_axis_path = f"data/BEAT/beat_cache/{opt.beat_cache_name}/train/axis_angle_mean.npy"
+        std_axis_path = f"data/BEAT/beat_cache/{opt.beat_cache_name}/train/axis_angle_std.npy"
+        mean_euler_path = f"data/BEAT/beat_cache/{opt.beat_cache_name}/train/bvh_rot/bvh_mean.npy"
+        std_euler_path = f"data/BEAT/beat_cache/{opt.beat_cache_name}/train/bvh_rot/bvh_std.npy"
+        
+        test_dataset_mean_axis = torch.from_numpy(np.load(mean_axis_path)).float()
+        test_dataset_std_axis = torch.from_numpy(np.load(std_axis_path)).float()
+        test_dataset_mean_pose = torch.from_numpy(np.load(mean_euler_path)).float()
+        test_dataset_std_pose = torch.from_numpy(np.load(std_euler_path)).float()
+        
+        # Convert axis-angle to Euler (same as official runner)
+        out_motions = torch.from_numpy(out_motions)
+        denorm_out = out_motions * test_dataset_std_axis + test_dataset_mean_axis
+        B, T, C = denorm_out.shape
+        euler_out = rot_cvt.axis_angle_to_euler_angles(denorm_out.reshape(B, T, C//3, 3)).reshape(B, T, C)
+        euler_out = euler_out * (180 / np.pi)
+        out_motions = (euler_out - test_dataset_mean_pose) / test_dataset_std_pose
+        out_motions = out_motions.numpy()
+    
+    # Save outputs (same as official runner)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create gesture and expression directories
+    gesture_dir = os.path.join(output_dir, 'gesture')
+    expression_dir = os.path.join(output_dir, 'expression')
+    os.makedirs(os.path.join(gesture_dir, 'bvh'), exist_ok=True)
+    os.makedirs(os.path.join(expression_dir, 'face_json'), exist_ok=True)
+    
+    # Save gesture as numpy and BVH
+    np.save(os.path.join(gesture_dir, f"{name.split('.')[0]}.npy"), out_motions)
+    out_denorm_euler = euler_out.reshape(-1, opt.dim_pose).numpy()
+    trainer.result2target_vis(
+        out_denorm_euler, 
+        os.path.join(gesture_dir, 'bvh'), 
+        f"{name.split('.')[0]}.bvh"
+    )
+    print(f"[OFFICIAL EXPORT] Saved BVH to {gesture_dir}/bvh/{name.split('.')[0]}.bvh")
+    
+    # Save expression as numpy and JSON
+    if opt.unidiffuser or opt.net_dim_pose == 192:
+        np.save(os.path.join(expression_dir, f"{name.split('.')[0]}.npy"), out_expression)
+        trainer.write_face_json(
+            out_expression, 
+            os.path.join(expression_dir, 'face_json', f"{name.split('.')[0]}.json")
+        )
+        print(f"[OFFICIAL EXPORT] Saved JSON to {expression_dir}/face_json/{name.split('.')[0]}.json")
+    
+    print("[OFFICIAL EXPORT] Export complete!")
+    return gesture_dir, expression_dir
+
+
 def main():
     global waypoint_collector
     
@@ -433,12 +661,19 @@ def main():
     # Enable reference pipeline mode (uses exact same code as official runner.py)
     DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = True
     
+    # Enable using the same export logic as official runner.py
+    # When True, bypasses WaypointCollector and uses trainer's export methods directly
+    USE_SAME_EXPORT = True
+    
     print("="*60)
     print(f"{'ENABLING' if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK else 'DISABLING'} NON_STREAMING_SANITY_CHECK MODE")
     print("This will wait for full audio before generating")
     print()
     print(f"{'ENABLING' if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE else 'DISABLING'} SANITY_CHECK_USE_REFERENCE_PIPELINE MODE")
     print("This will use the EXACT same code as official runner.py")
+    print()
+    print(f"{'ENABLING' if USE_SAME_EXPORT else 'DISABLING'} USE_SAME_EXPORT MODE")
+    print("This will use the EXACT same export logic as official runner.py")
     print("="*60)
 
 
@@ -521,26 +756,66 @@ def main():
     output_dir = 'results/realtime_test'
     os.makedirs(output_dir, exist_ok=True)
     
-    waypoint_collector.save_to_files(
-        output_dir=output_dir,
-        trainer=trainer,
-        audio_duration=audio_duration
-    )
-    
-    # Copy audio file to output directory for convenience
-    audio_output_path = os.path.join(output_dir, os.path.basename(audio_path))
-    shutil.copy(audio_path, audio_output_path)
-    print(f"[EXPORT] Copied audio to {audio_output_path}")
+    if USE_SAME_EXPORT:
+        # Use official runner.py export logic
+        print("\n[USE_SAME_EXPORT=True] Using official runner.py export logic...")
+        
+        # Get pre-generated motion from wrapper (if available) to avoid regeneration
+        pre_generated_motion = None
+        if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE:
+            pre_generated_motion = wrapper.last_generated_motion
+            if pre_generated_motion is not None:
+                print("[USE_SAME_EXPORT] Using pre-generated motion from wrapper (avoiding regeneration)")
+            else:
+                print("[USE_SAME_EXPORT] No pre-generated motion found, will run full generation")
+        
+        gesture_dir, expression_dir = official_export_logic(
+            audio_path=audio_path,
+            trainer=trainer,
+            opt=opt,
+            output_dir=output_dir,
+            pre_generated_motion=pre_generated_motion
+        )
+        
+        # Copy audio file to output directory for convenience
+        audio_output_path = os.path.join(output_dir, os.path.basename(audio_path))
+        shutil.copy(audio_path, audio_output_path)
+        print(f"[EXPORT] Copied audio to {audio_output_path}")
+        
+        # Prepare Blender paths
+        audio_name = os.path.basename(audio_path).split('.')[0]
+        bvh_path = os.path.join(gesture_dir, 'bvh', f'{audio_name}.bvh')
+        json_path = os.path.join(expression_dir, 'face_json', f'{audio_name}.json')
+        video_path = os.path.join(output_dir, f'{audio_name}.mp4')
+        
+    else:
+        # Use WaypointCollector export logic
+        print("\n[USE_SAME_EXPORT=False] Using WaypointCollector export logic...")
+        waypoint_collector.save_to_files(
+            output_dir=output_dir,
+            trainer=trainer,
+            audio_duration=audio_duration
+        )
+        
+        # Copy audio file to output directory for convenience
+        audio_output_path = os.path.join(output_dir, os.path.basename(audio_path))
+        shutil.copy(audio_path, audio_output_path)
+        print(f"[EXPORT] Copied audio to {audio_output_path}")
+        
+        # Prepare Blender paths
+        bvh_path = os.path.join(output_dir, 'bvh', 'realtime_output.bvh')
+        json_path = os.path.join(output_dir, 'face_json', 'realtime_output.json')
+        video_path = os.path.join(output_dir, 'realtime_output.mp4')
     
     print("\n" + "="*60)
     print("Next Steps for Blender Visualization:")
     print("="*60)
     print("1. Open assets/beat_visualize.blend in Blender")
     print("2. Open the Scripting tab and update these paths in blender_script_text:")
-    print(f"\n   FACE_ANIM_NAME = r\"{os.path.abspath(os.path.join(output_dir, 'face_json', 'realtime_output.json'))}\"")
+    print(f"\n   FACE_ANIM_NAME = r\"{os.path.abspath(json_path)}\"")
     print(f"   SOUND_NAME = r\"{os.path.abspath(audio_output_path)}\"")
-    print(f"   MOTION_NAME = r\"{os.path.abspath(os.path.join(output_dir, 'bvh', 'realtime_output.bvh'))}\"")
-    print(f"   VIDEO_NAME = r\"{os.path.abspath(os.path.join(output_dir, 'realtime_output.mp4'))}\"")
+    print(f"   MOTION_NAME = r\"{os.path.abspath(bvh_path)}\"")
+    print(f"   VIDEO_NAME = r\"{os.path.abspath(video_path)}\"")
     print("\n3. Run the script in Blender (Alt+P) to render the video")
     print("="*60)
     
