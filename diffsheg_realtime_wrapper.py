@@ -229,10 +229,19 @@ class DiffSHEGRealtimeWrapper:
     - When enabled, waits for full audio before generating
     - Useful for debugging and comparing with official offline generation
     - When False (default), operates in streaming mode for real-time interaction
+    
+    USE_CONSTRAINED_FEATURES mode:
+    - When False (default), streaming mode computes features from [0, window_end]
+    - When True, constrains audio context to AUDIO_DUR_FOR_FEATURES seconds
+    - This ensures stable performance regardless of utterance length
     """
     
     # Global flag for sanity check mode
     NON_STREAMING_SANITY_CHECK = False
+    
+    # Global flags for constrained feature extraction
+    USE_CONSTRAINED_FEATURES = False
+    AUDIO_DUR_FOR_FEATURES = 5.0  # Duration in seconds for constrained audio context
     
     def __init__(
         self,
@@ -373,6 +382,10 @@ class DiffSHEGRealtimeWrapper:
         else:
             self.logger.info("="*60)
             self.logger.info("STREAMING MODE: Real-time generation")
+            if DiffSHEGRealtimeWrapper.USE_CONSTRAINED_FEATURES:
+                self.logger.info(f"CONSTRAINED FEATURES: Enabled (duration={DiffSHEGRealtimeWrapper.AUDIO_DUR_FOR_FEATURES}s)")
+            else:
+                self.logger.info("CONSTRAINED FEATURES: Disabled (using full audio context)")
             self.logger.info("="*60)
         
         if self.NON_STREAMING_SANITY_CHECK:
@@ -891,13 +904,36 @@ class DiffSHEGRealtimeWrapper:
                 sample_rate = utterance.sample_rate
                 gesture_fps = utterance.gesture_fps
                 
-                # CRITICAL FIX: Snapshot ALL audio from start to window end (not just the window)
-                # This is needed because mel/HuBERT features must be computed over full context
-                # Following official code pattern: compute features for entire audio, then window them
-                audio_snapshot_full = utterance.get_audio_window(0, window_end_sample)
-                
-                window_duration = (window_end_sample - window_start_sample) / sample_rate
-                self.logger.debug(f"Utterance {utterance_id} generation triggered: window [{window_start_sample}-{window_end_sample}] ({window_duration:.3f}s), available_samples={available_samples}, full_context_samples={window_end_sample}")
+                # Determine audio snapshot range based on USE_CONSTRAINED_FEATURES flag
+                if self.USE_CONSTRAINED_FEATURES:
+                    # Constrained mode: Use only AUDIO_DUR_FOR_FEATURES seconds of audio
+                    constrained_samples = int(self.AUDIO_DUR_FOR_FEATURES * sample_rate)
+                    # Take audio from [window_end - constrained_samples, window_end]
+                    # But ensure we don't go negative
+                    audio_start_sample = max(0, window_end_sample - constrained_samples)
+                    audio_snapshot_full = utterance.get_audio_window(audio_start_sample, window_end_sample)
+                    
+                    window_duration = (window_end_sample - window_start_sample) / sample_rate
+                    constrained_duration = (window_end_sample - audio_start_sample) / sample_rate
+                    self.logger.debug(
+                        f"Utterance {utterance_id} generation triggered (CONSTRAINED): "
+                        f"window [{window_start_sample}-{window_end_sample}] ({window_duration:.3f}s), "
+                        f"audio_context [{audio_start_sample}-{window_end_sample}] ({constrained_duration:.3f}s), "
+                        f"available_samples={available_samples}"
+                    )
+                else:
+                    # Default mode: Snapshot ALL audio from start to window end (not just the window)
+                    # This is needed because mel/HuBERT features must be computed over full context
+                    # Following official code pattern: compute features for entire audio, then window them
+                    audio_start_sample = 0
+                    audio_snapshot_full = utterance.get_audio_window(0, window_end_sample)
+                    
+                    window_duration = (window_end_sample - window_start_sample) / sample_rate
+                    self.logger.debug(
+                        f"Utterance {utterance_id} generation triggered: "
+                        f"window [{window_start_sample}-{window_end_sample}] ({window_duration:.3f}s), "
+                        f"available_samples={available_samples}, full_context_samples={window_end_sample}"
+                    )
                 
                 # Snapshot overlap context if needed for smooth transitions
                 # Frames are gesture poses indexed at gesture_fps (e.g., 15 FPS for BEAT)
@@ -919,13 +955,14 @@ class DiffSHEGRealtimeWrapper:
                 # Generate gestures for this window
                 gen_start_time = time.time()
                 window = self._generate_gesture_window_from_audio(
-                    audio_snapshot_full,  # Pass full audio context
+                    audio_snapshot_full,  # Pass audio context
                     window_start_sample,
                     window_end_sample,
                     sample_rate,
                     gesture_fps,
                     overlap_context,
-                    utterance_id
+                    utterance_id,
+                    audio_context_start_sample=audio_start_sample  # Pass context start for proper windowing
                 )
                 gen_duration = time.time() - gen_start_time
                 if window:
@@ -961,7 +998,8 @@ class DiffSHEGRealtimeWrapper:
         overlap_context: Optional[List[np.ndarray]],
         utterance_id: int,
         precomputed_mel: Optional[torch.Tensor] = None,
-        precomputed_hubert: Optional[torch.Tensor] = None
+        precomputed_hubert: Optional[torch.Tensor] = None,
+        audio_context_start_sample: int = 0
     ) -> WaypointWindow:
         """
         Generate gestures for a single window using official DiffSHEG pipeline.
@@ -970,10 +1008,15 @@ class DiffSHEGRealtimeWrapper:
         trainers/ddpm_beat_trainer.py::test_custom_aud(), adapted for single-window generation.
         
         KEY STRATEGY FOR STREAMING:
-        - audio_bytes_truncated contains audio from [0, window_end_sample]
-        - We compute mel/HuBERT features for this truncated audio (as if no future audio exists)
+        - audio_bytes_truncated contains audio from [audio_context_start_sample, window_end_sample]
+        - We compute mel/HuBERT features for this audio context
         - We then window these features to extract the current window portion
         - This ensures temporal consistency while enabling streaming
+        
+        CONSTRAINED FEATURES MODE:
+        - When USE_CONSTRAINED_FEATURES=True, audio_context_start_sample may be > 0
+        - Features are extracted from constrained audio context [audio_context_start_sample, window_end_sample]
+        - Window indexing accounts for the offset via audio_context_start_sample parameter
         
         NON-STREAMING MODE (precomputed_mel/hubert provided):
         - Features are extracted once for the full audio
@@ -989,9 +1032,9 @@ class DiffSHEGRealtimeWrapper:
         6. Generate with trainer.generate_batch() using inpainting for overlap
         
         Args:
-            audio_bytes_truncated: Raw audio bytes from [0, window_end_sample] (s16le encoded)
-                                   In streaming mode, this "pretends" that audio only extends to window_end
-                                   In non-streaming mode, this can be ignored if precomputed features are provided
+            audio_bytes_truncated: Raw audio bytes (s16le encoded)
+                                   In streaming mode: from [audio_context_start_sample, window_end_sample]
+                                   In non-streaming mode: can be ignored if precomputed features are provided
             window_start_sample: Starting sample index of this window in the full utterance
             window_end_sample: Ending sample index of this window (where audio is truncated)
             sample_rate: Audio sample rate (e.g., 16000 Hz)
@@ -1001,6 +1044,8 @@ class DiffSHEGRealtimeWrapper:
             utterance_id: ID of the utterance (for debugging/logging)
             precomputed_mel: Optional precomputed mel features [1, T, 128] for non-streaming mode
             precomputed_hubert: Optional precomputed HuBERT features [1, T, 1024] for non-streaming mode
+            audio_context_start_sample: Starting sample index of the audio context (default 0)
+                                       Used to correctly window features when using constrained context
         
         Returns:
             WaypointWindow containing execution waypoints and context waypoints
@@ -1027,9 +1072,12 @@ class DiffSHEGRealtimeWrapper:
         
         # ===== STEP 5: Window the features to get current window portion =====
         window_start_frame = int(round(window_start_sample / sample_rate * gesture_fps))
+        audio_context_start_frame = int(round(audio_context_start_sample / sample_rate * gesture_fps))
         
-        # Extract window from full features (features span [0, window_end_sample])
-        mel_window_start = window_start_frame
+        # Extract window from features
+        # Features span [audio_context_start_sample, window_end_sample]
+        # So we need to offset the window indices by audio_context_start_frame
+        mel_window_start = window_start_frame - audio_context_start_frame
         mel_window_end = mel_window_start + self.window_size
         
         audio_window = audio_emb[:, mel_window_start:mel_window_end, :]
