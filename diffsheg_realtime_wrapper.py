@@ -1143,7 +1143,7 @@ class DiffSHEGRealtimeWrapper:
         Extract HuBERT features from 16kHz audio using the official function.
         
         Args:
-            speech_array: Audio numpy array of shape [T] at 16kHz (1D, NOT tensor)
+            speech_array: Audio numpy array of shape [T] at 16kHz (1D)
             
         Returns:
             HuBERT features of shape [T_hubert, 1024] (torch.Tensor on CPU)
@@ -1154,11 +1154,13 @@ class DiffSHEGRealtimeWrapper:
             return None
         
         with torch.no_grad():
-            # Official function expects numpy array, not tensor
+            # Official function expects 2D tensor [1, T] on device
+            # Convert numpy array to tensor and add batch dimension
+            speech_tensor = torch.from_numpy(speech_array).unsqueeze(0).to(self.device)
             return get_hubert_from_16k_speech_long(
                 self.hubert_model,
                 self.wav2vec2_processor,
-                speech_array,  # Pass numpy array directly
+                speech_tensor,  # Pass 2D tensor [1, T] on device
                 device=self.device
             )
 
