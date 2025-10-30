@@ -728,6 +728,7 @@ class DiffSHEGRealtimeWrapper:
             self.logger.info("[SANITY CHECK] Executing all waypoints through callback...")
             for waypoint in all_waypoints:
                 self.waypoint_callback(waypoint)
+                time.sleep(0.01)  
             self.logger.info("[SANITY CHECK] All waypoints executed")
         else:
             self.logger.warning("[SANITY CHECK] No waypoint callback provided, waypoints not executed")
@@ -1067,7 +1068,7 @@ class DiffSHEGRealtimeWrapper:
         p_id = torch.zeros((1, 1), device=self.device) + 2 ## Use pid 2
         p_id = self.model.one_hot(p_id, self.opt.speaker_dim).to(self.device)
         
-        
+
         add_cond: Dict[str, torch.Tensor] = {}
         if hubert_feat_full is not None:
             hubert_window = hubert_feat_full[:, mel_window_start:mel_window_end, :]
