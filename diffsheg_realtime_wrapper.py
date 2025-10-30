@@ -511,13 +511,14 @@ class DiffSHEGRealtimeWrapper:
         """
         with self.utterance_lock:
             # Add to cancelled set to reject any late-arriving chunks
-            self.cancelled_utterances.add(self.current_utterance.utterance_id)
-            
-            # Then, simply discard everything - generation is faster than realtime
-            # so we can regenerate from scratch for the next utterance
-            total_samples = self.current_utterance.get_total_samples()
-            self.logger.debug(f"Cancel utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
-            self.current_utterance = None
+            if self.current_utterance is not None:
+                self.cancelled_utterances.add(self.current_utterance.utterance_id)
+                
+                # Then, simply discard everything - generation is faster than realtime
+                # so we can regenerate from scratch for the next utterance
+                total_samples = self.current_utterance.get_total_samples()
+                self.logger.debug(f"Cancel utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
+                self.current_utterance = None
 
     def _cleanup_current_utterance(self):
         """
