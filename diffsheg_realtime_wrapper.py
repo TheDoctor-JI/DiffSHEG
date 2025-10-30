@@ -4,35 +4,30 @@ DiffSHEG Realtime Wrapper for GPT-4o Dialogue System Integration
 This wrapper class manages the integration of DiffSHEG gesture generation with
 a real-time dialogue system that receives audio chunks from GPT-4o-realtime.
 
-TESTING/DEBUGGING MODES:
-========================
+OPERATING MODES:
+================
 
-The wrapper supports multiple operating modes via class-level flags:
+The wrapper supports two operating modes via the NON_STREAMING_SANITY_CHECK flag:
 
 1. STREAMING MODE (default):
    - NON_STREAMING_SANITY_CHECK = False
-   - SANITY_CHECK_USE_REFERENCE_PIPELINE = False (ignored)
    - Real-time gesture generation as audio chunks arrive
    - Uses incremental windowing with overlap context
+   - Audio is truncated to [0, window_end] for each window generation
    
 2. NON-STREAMING SANITY CHECK MODE:
    - NON_STREAMING_SANITY_CHECK = True
-   - SANITY_CHECK_USE_REFERENCE_PIPELINE = False
    - Waits for complete audio before generating
-   - Uses wrapper's own generation pipeline
-   - Useful for debugging without streaming complexity
-   
-3. REFERENCE PIPELINE MODE (best for comparing with official output):
-   - NON_STREAMING_SANITY_CHECK = True
-   - SANITY_CHECK_USE_REFERENCE_PIPELINE = True
-   - Uses EXACT same code as official runner.py::test_custom_aud()
-   - Bypasses ALL wrapper-specific code (feature extraction, windowing, etc.)
-   - Should produce IDENTICAL results to official runner
-   - If output still differs, issue is in waypoint conversion/saving logic
+   - Generates window by window with audio truncation
+   - Useful for debugging and comparing with official offline generation
 
-To enable these modes, set the flags BEFORE creating the wrapper:
+Both modes use the EXACT same official generation pipeline from DiffSHEG:
+- Official mel spectrogram extraction (librosa.feature.melspectrogram)
+- Official HuBERT feature extraction (get_hubert_from_16k_speech_long)
+- Official trainer.generate_batch() method with proper inpainting
+
+To enable sanity check mode, set the flag BEFORE creating the wrapper:
     DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
-    DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE = True
     wrapper = DiffSHEGRealtimeWrapper(...)
 """
 
@@ -66,7 +61,6 @@ class Utterance:
     def __init__(
         self, 
         utterance_id: int,
-        start_margin: float,
         sample_rate: int,
         gesture_fps: int,
         window_size: int,
@@ -75,7 +69,6 @@ class Utterance:
     ):
         self.utterance_id = utterance_id
         self.start_time: Optional[float] = None
-        self.start_margin = start_margin  # Time offset (in seconds) from utterance start where gesture generation begins
         self.last_chunk_received_time: float = None # Track when last chunk arrived
         self.gesture_waypoints = gesture_waypoints  # Gesture waypoints for this utterance
         
@@ -89,13 +82,11 @@ class Utterance:
         self.window_size = window_size  # Number of frames per window
         self.window_step = window_step  # Number of non-overlapping frames per window
         
-        # Initialize window indices based on start_margin
-        # First window starts at start_margin seconds into the utterance
-        start_margin_samples = int(start_margin * sample_rate)
+        # Initialize window indices - start from sample 0 (beginning of utterance)
         window_duration_samples = int((window_size / gesture_fps) * sample_rate)
         
-        self.next_window_start_sample: int = start_margin_samples
-        self.next_window_end_sample: int = start_margin_samples + window_duration_samples
+        self.next_window_start_sample: int = 0
+        self.next_window_end_sample: int = window_duration_samples
     
     def add_audio_samples(self, audio_data):
         """
@@ -225,32 +216,23 @@ class DiffSHEGRealtimeWrapper:
     
     Features:
     - Tracks utterance lifecycle and audio chunks
-    - Schedules gesture generation with configurable start margin
     - Manages two threads: playback monitoring and gesture generation
     - Generation thread uses snapshot-based approach for lock-free inference
     
     NON_STREAMING_SANITY_CHECK mode:
     - When enabled, waits for full audio before generating
-    - Uses full audio context for all windows (not just up to window end)
     - Useful for debugging and comparing with official offline generation
-    
-    SANITY_CHECK_USE_REFERENCE_PIPELINE mode:
-    - When enabled together with NON_STREAMING_SANITY_CHECK, uses the exact
-      same code as the official runner.py test_custom_aud() method
-    - Bypasses all wrapper-specific generation code
-    - Should produce identical output to official runner for comparison
+    - When False (default), operates in streaming mode for real-time interaction
     """
     
-    # Global flags for sanity check modes
+    # Global flag for sanity check mode
     NON_STREAMING_SANITY_CHECK = False
-    SANITY_CHECK_USE_REFERENCE_PIPELINE = False
     
     def __init__(
         self,
         diffsheg_model,
         opt,
         config: dict = None,
-        default_start_margin: float = None,
         audio_sr: int = None,
         device: str = None,
         cleanup_timeout: float = None,
@@ -264,8 +246,6 @@ class DiffSHEGRealtimeWrapper:
             opt: Configuration options
             config: Configuration dictionary (typically from YAML). If provided, will be used
                    for default values. Individual parameters override config values.
-            default_start_margin: Time offset (in seconds) from utterance start where gesture 
-                                 generation begins. If None, reads from config or uses 0.5.
             audio_sr: Audio sample rate. If None, reads from config or uses 16000.
             device: Computing device. If None, reads from config or uses opt.device.
             cleanup_timeout: Seconds to wait after playback ends before auto-cleanup.
@@ -282,10 +262,6 @@ class DiffSHEGRealtimeWrapper:
         gesture_config = self.config.get('co_speech_gestures', {})
         
         # Load parameters with priority: explicit parameter > config > default
-        self.default_start_margin = (
-            default_start_margin if default_start_margin is not None 
-            else gesture_config.get('start_margin', 0.5)
-        )
         self.audio_sr = (
             audio_sr if audio_sr is not None
             else gesture_config.get('audio_sr', 16000)
@@ -317,7 +293,7 @@ class DiffSHEGRealtimeWrapper:
             terminal_log_level="INFO"
         )
         self.logger.info("DiffSHEG Realtime Wrapper initialized")
-        self.logger.info(f"Configuration: sample_rate={self.audio_sr}, device={self.device}, start_margin={self.default_start_margin}s")
+        self.logger.info(f"Configuration: sample_rate={self.audio_sr}, device={self.device}")
         
         # Check if HuBERT features are needed
         self.use_hubert = getattr(opt, 'addHubert', False) or getattr(opt, 'expAddHubert', False)
@@ -449,7 +425,7 @@ class DiffSHEGRealtimeWrapper:
     '''
 
     def add_audio_chunk(self, utterance_id: int, chunk_index: int, audio_data: list, 
-                        duration: float, start_margin: Optional[float] = None):
+                        duration: float):
         """
         Add a new audio chunk from the dialogue system.
         Playback automatically starts when the first chunk (chunk_index=0) arrives.
@@ -460,10 +436,6 @@ class DiffSHEGRealtimeWrapper:
             chunk_index: Position of this chunk within the utterance (starts from 0)
             audio_data: Raw audio data (list of integers)
             duration: Duration of the chunk in seconds (not used internally, kept for API compatibility)
-            start_margin: Optional time offset (in seconds) for when gesture generation starts.
-                         If None, uses default_start_margin. The first generation window will
-                         begin at this offset from the utterance start. For example, with
-                         start_margin=0.5, generation begins at t=0.5s into the utterance.
         """
         # Reject chunks for cancelled/timed-out utterances
         if utterance_id in self.cancelled_utterances:
@@ -485,17 +457,15 @@ class DiffSHEGRealtimeWrapper:
                     self.cancelled_utterances.add(old_utterance_id)
                     self.logger.info(f"Utterance {old_utterance_id} replaced by new utterance {utterance_id}")
                 
-                margin = start_margin if start_margin is not None else self.default_start_margin
                 self.current_utterance = Utterance(
                     utterance_id=utterance_id,
-                    start_margin=margin,
                     sample_rate=self.audio_sr,
                     gesture_fps=self.gesture_fps,
                     window_size=self.window_size,
                     window_step=self.window_step,
                     gesture_waypoints=GestureWaypoints(gesture_fps=self.gesture_fps)
                 )
-                self.logger.info(f"New utterance created: id={utterance_id}, start_margin={margin}s")
+                self.logger.info(f"New utterance created: id={utterance_id}")
             
             utterance = self.current_utterance
             
@@ -705,11 +675,6 @@ class DiffSHEGRealtimeWrapper:
     
     def _sanity_check_generate_all(self):
         """Generate all windows for the current utterance using full audio context."""
-        # Check if we should use reference pipeline
-        if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE:
-            self._sanity_check_reference_pipeline()
-            return
-        
         with self.utterance_lock:
             utterance = self.current_utterance
             if utterance is None:
@@ -728,7 +693,7 @@ class DiffSHEGRealtimeWrapper:
                 f"total_samples={total_samples}, duration={total_samples/sample_rate:.2f}s"
             )
         
-        # Generate all windows
+        # Generate all windows with audio truncation (simulating streaming)
         all_waypoints = []
         all_window_outputs = []  # Collect raw outputs for export
         overlap_context = None
@@ -738,14 +703,18 @@ class DiffSHEGRealtimeWrapper:
         
         window_idx = 0
         while window_start_sample < total_samples:
+            # Truncate audio to [0, window_end] (simulate streaming: pretend no future audio exists)
+            audio_truncated = full_audio_bytes[:window_end_sample * 2]  # *2 because s16le (2 bytes/sample)
+            
             self.logger.info(
                 f"[SANITY CHECK] Generating window {window_idx}: "
-                f"samples [{window_start_sample}-{window_end_sample}]"
+                f"samples [{window_start_sample}-{window_end_sample}], "
+                f"truncated_audio_samples={len(audio_truncated)//2}"
             )
             
-            # Generate this window using FULL audio
+            # Generate this window using TRUNCATED audio [0, window_end]
             waypoints = self._generate_gesture_window_from_audio(
-                full_audio_bytes,  # CRITICAL: Pass full audio, not windowed
+                audio_truncated,  # CRITICAL: Pass truncated audio [0, window_end]
                 window_start_sample,
                 min(window_end_sample, total_samples),
                 sample_rate,
@@ -796,222 +765,6 @@ class DiffSHEGRealtimeWrapper:
         else:
             self.logger.warning("[SANITY CHECK] No waypoint callback provided, waypoints not executed")
 
-    def _sanity_check_reference_pipeline(self):
-        """
-        Use the EXACT same generation pipeline as the official runner.py test_custom_aud() method.
-        
-        This method is a LINE-BY-LINE replication of the official DiffSHEG inference code from
-        trainers/ddpm_beat_trainer.py::test_custom_aud(). It bypasses ALL wrapper-specific code
-        including:
-        - Wrapper's audio feature extraction (_compute_full_audio_features)
-        - Wrapper's windowed generation (_generate_gesture_window_from_audio)
-        - Wrapper's window management logic
-        
-        Instead, it uses:
-        - Official mel spectrogram extraction
-        - Official HuBERT feature extraction (get_hubert_from_16k_speech_long)
-        - Official window generation logic (get_windows)
-        - Official trainer.generate_batch() method
-        
-        This ensures that any differences between wrapper output and official output can ONLY be
-        due to the waypoint conversion/saving logic, not the generation pipeline itself.
-        
-        Use this when SANITY_CHECK_USE_REFERENCE_PIPELINE flag is True.
-        """
-        self.logger.info("[REFERENCE PIPELINE] Using official runner.py generation pipeline")
-        self.logger.info("[REFERENCE PIPELINE] Bypassing ALL wrapper-specific generation code")
-        
-        with self.utterance_lock:
-            utterance = self.current_utterance
-            if utterance is None:
-                return
-            
-            utterance_id = utterance.utterance_id
-            total_samples = utterance.get_total_samples()
-            sample_rate = utterance.sample_rate
-            
-            # Get full audio as float32 array
-            full_audio_bytes = utterance.get_audio_window(0, total_samples)
-        
-        # Convert bytes to float32 numpy array (same as official runner expects)
-        audio_int16 = np.frombuffer(full_audio_bytes, dtype=np.int16)
-        aud_ori = audio_int16.astype(np.float32) / 32768.0  # Normalize to [-1, 1]
-        
-        self.logger.info(
-            f"[REFERENCE PIPELINE] Loaded audio: shape={aud_ori.shape}, "
-            f"duration={len(aud_ori)/sample_rate:.2f}s"
-        )
-        
-        # ===== EXACT REPLICATION OF OFFICIAL RUNNER.PY =====
-        # This code is copied directly from trainers/ddpm_beat_trainer.py test_custom_aud()
-        
-        trainer = self.model  # This is the DDPMTrainer_beat instance
-        opt = self.opt
-        device = self.device
-        
-        # Resample to 18000Hz for mel spectrogram (official pipeline)
-        aud = librosa.resample(aud_ori, orig_sr=sample_rate, target_sr=18000)
-        
-        # Extract mel spectrogram
-        self.logger.info("[REFERENCE PIPELINE] Extracting mel spectrogram...")
-        mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
-        mel = mel[..., :-1]
-        audio_emb = torch.from_numpy(np.swapaxes(mel, -1, -2))
-        audio_emb = audio_emb.unsqueeze(0).to(device)
-        
-        B, N, _ = audio_emb.shape
-        C = opt.net_dim_pose
-        motions = torch.zeros((B, audio_emb.shape[-2], C)).to(device)
-        
-        # Define get_windows function (from official runner)
-        def get_windows(x, size, step):
-            if isinstance(x, dict):
-                out = {}
-                for key in x.keys():
-                    out[key] = get_windows(x[key], size, step)
-                out_dict_list = []
-                for i in range(len(out[list(out.keys())[0]])):
-                    out_dict_list.append({key: out[key][i] for key in out.keys()})
-                return out_dict_list
-            else:
-                seq_len = x.shape[1]
-                if seq_len <= size:
-                    return [x]
-                else:
-                    win_num = (seq_len - (size-step)) / float(step)
-                    out = [x[:, mm*step : mm*step + size, ...] for mm in range(int(win_num))]
-                    if win_num - int(win_num) != 0:
-                        out.append(x[:, int(win_num)*step:, ...])  
-                    return out
-        
-        # Get windowed audio and motion
-        window_step = opt.n_poses - opt.overlap_len
-        audio_emb_list = get_windows(audio_emb, opt.n_poses, window_step)
-        motions_list = get_windows(motions, opt.n_poses, window_step)
-        
-        # Prepare additional conditioning (HuBERT features)
-        add_cond = {}
-        if opt.expAddHubert or opt.addHubert:
-            self.logger.info("[REFERENCE PIPELINE] Extracting HuBERT features...")
-            
-            # Check if HuBERT models are available
-            if not hasattr(self, 'hubert_model') or not hasattr(self, 'wav2vec2_processor'):
-                self.logger.error("[REFERENCE PIPELINE] HuBERT model not initialized!")
-                # Initialize HuBERT models
-                from transformers import Wav2Vec2Processor, HubertModel
-                self.logger.info("[REFERENCE PIPELINE] Loading HuBERT models...")
-                self.wav2vec2_processor = Wav2Vec2Processor.from_pretrained("facebook/hubert-large-ls960-ft")
-                self.hubert_model = HubertModel.from_pretrained("facebook/hubert-large-ls960-ft")
-                self.hubert_model = self.hubert_model.to(device)
-            
-            add_cond["pretrain_aud_feat"] = get_hubert_from_16k_speech_long(
-                self.hubert_model, 
-                self.wav2vec2_processor, 
-                torch.from_numpy(aud_ori).unsqueeze(0).to(device), 
-                device=device
-            )
-            add_cond["pretrain_aud_feat"] = F.interpolate(
-                add_cond["pretrain_aud_feat"].swapaxes(-1,-2).unsqueeze(0), 
-                size=audio_emb.shape[-2], 
-                mode='linear', 
-                align_corners=True
-            ).swapaxes(-1,-2)
-            
-            # Put dict values into device
-            for key in add_cond.keys():
-                add_cond[key] = add_cond[key].to(device)
-        
-        # Window the conditioning
-        if add_cond not in [None, {}]:
-            add_cond_list = get_windows(add_cond, opt.n_poses, window_step)
-        
-        # Prepare person ID (same as official runner: uses person ID 2, which is index 1)
-        p_id_ori = 2  # Person ID used in official test_custom_aud()
-        p_id = torch.ones((1, 1)) * (p_id_ori - 1)  # Convert to 0-indexed
-        p_id = trainer.one_hot(p_id, opt.speaker_dim).detach().to(device)
-        
-        # Generate motion for each window
-        self.logger.info(f"[REFERENCE PIPELINE] Generating {len(audio_emb_list)} windows...")
-        out_motions = []
-        
-        for ii, (audio_emb_win, motions_win) in enumerate(zip(audio_emb_list, motions_list)):
-            self.logger.info(f"[REFERENCE PIPELINE] Processing window {ii+1}/{len(audio_emb_list)}")
-            
-            if add_cond not in [None, {}]:
-                add_cond_win = add_cond_list[ii]
-            else:
-                add_cond_win = {}
-            
-            # Prepare inpainting dict for overlap
-            inpaint_dict = {}
-            if opt.overlap_len > 0:
-                inpaint_dict['gt'] = torch.zeros_like(motions_win)
-                inpaint_dict['outpainting_mask'] = torch.zeros_like(
-                    motions_win, dtype=torch.bool, device=motions_win.device
-                )
-                
-                if ii == 0:
-                    if opt.fix_very_first:
-                        inpaint_dict['outpainting_mask'][..., :opt.overlap_len, :] = True
-                        inpaint_dict['gt'][:, :opt.overlap_len, ...] = motions_win[:, -opt.overlap_len:, ...]
-                elif ii > 0:
-                    inpaint_dict['outpainting_mask'][..., :opt.overlap_len, :] = True
-                    inpaint_dict['gt'][:, :opt.overlap_len, ...] = outputs[:, -opt.overlap_len:, ...]
-            
-            # Generate using official trainer method
-            outputs = trainer.generate_batch(
-                audio_emb_win, p_id, opt.net_dim_pose, add_cond_win, inpaint_dict
-            )
-            
-            outputs_np = outputs.cpu().numpy()
-            if ii == len(motions_list) - 1:
-                out_motions.append(outputs_np)
-            else:
-                out_motions.append(outputs_np[:, :window_step])
-        
-        # Concatenate all windows
-        out_motions = np.concatenate(out_motions, 1)  # [B, T, C]
-        self.logger.info(f"[REFERENCE PIPELINE] Generated motion: shape={out_motions.shape}")
-        
-        # Store the generated motion for optional export (avoids regeneration)
-        self.last_generated_motion = torch.from_numpy(out_motions)
-        self.logger.info("[REFERENCE PIPELINE] Stored generated motion for export")
-        
-        # NOTE: Keep gesture and expression COMBINED for waypoints
-        # The WaypointCollector will handle splitting when saving to files
-        # out_motions contains full gesture+expression if opt.net_dim_pose == 192
-        
-        # Convert to waypoints
-        # out_motions shape: [1, T, C] where C is net_dim_pose (192 for gesture+expression)
-        all_waypoints = []
-        gesture_fps = self.gesture_fps
-        
-        for frame_idx in range(out_motions.shape[1]):
-            timestamp = frame_idx / gesture_fps
-            gesture_data = out_motions[0, frame_idx, :]  # [C,] - full gesture+expression
-            
-            waypoint = GestureWaypoint(
-                waypoint_index=frame_idx,
-                timestamp=timestamp,
-                gesture_data=gesture_data
-            )
-            all_waypoints.append(waypoint)
-        
-        self.logger.info(
-            f"[REFERENCE PIPELINE] Created {len(all_waypoints)} waypoints "
-            f"at {gesture_fps} FPS"
-        )
-        
-        # Execute all waypoints through callback
-        if self.waypoint_callback is not None:
-            self.logger.info("[REFERENCE PIPELINE] Executing all waypoints through callback...")
-            for waypoint in all_waypoints:
-                self.waypoint_callback(waypoint)
-                time.sleep(0.01)
-            self.logger.info("[REFERENCE PIPELINE] All waypoints executed")
-        else:
-            self.logger.warning("[REFERENCE PIPELINE] No waypoint callback provided")
-
     '''
     Gesture generation scheduling
     '''
@@ -1021,17 +774,20 @@ class DiffSHEGRealtimeWrapper:
         Thread 2: Monitor available audio and trigger gesture generation windows.
         
         Generation strategy:
-        - Window indices are initialized automatically when utterance is created
+        - Window indices are initialized automatically when utterance is created (starts from sample 0)
         - Wait until enough audio samples are available to fill next_window_end_sample
-        - Snapshot the required audio samples, release lock, and generate gestures
+        - Snapshot truncated audio [0, window_end], release lock, and generate gestures
         - After generation, acquire lock and write waypoints back (if utterance still exists)
         - Update window indices using utterance.update_window_indices() for next generation
         
-        CRITICAL: Audio features (mel, HuBERT) must be computed from ALL audio up to current window end,
-        not just the current window, to maintain temporal consistency. Then window the features.
+        Audio truncation for streaming:
+        - Snapshots audio from [0, window_end] (as if no future audio exists)
+        - Generation method extracts mel/HuBERT features from this truncated audio
+        - Features are then windowed to get the current window portion
+        - This ensures streaming compatibility while using official generation code
         
         Desired behaviors:
-        - start_margin controls where the first window begins (not from t=0)
+        - Starts generation from t=0 (first window begins at sample 0)
         - If utterance tail is insufficient for a full window, no generation is triggered
         - Generation naturally stays ahead of playback since it's faster than realtime
         """
@@ -1137,110 +893,9 @@ class DiffSHEGRealtimeWrapper:
                     utterance.update_window_indices()
                     self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{utterance.next_window_start_sample}-{utterance.next_window_end_sample}] (step={utterance.next_window_start_sample - (prev_window_end - (utterance.next_window_end_sample - utterance.next_window_start_sample))} samples)")
 
-    
-    def _get_hubert_from_16k_speech(self, speech_array):
-        """
-        Extract HuBERT features from 16kHz audio using the official function.
-        
-        Args:
-            speech_array: Audio numpy array of shape [T] at 16kHz (1D)
-            
-        Returns:
-            HuBERT features of shape [T_hubert, 1024] (torch.Tensor on CPU)
-        """
-        # Use the official function imported from trainers.ddpm_beat_trainer
-        if get_hubert_from_16k_speech_long is None:
-            self.logger.error("get_hubert_from_16k_speech_long not available")
-            return None
-        
-        with torch.no_grad():
-            # Official function expects 2D tensor [1, T] on device
-            # Convert numpy array to tensor and add batch dimension
-            speech_tensor = torch.from_numpy(speech_array).unsqueeze(0).to(self.device)
-            return get_hubert_from_16k_speech_long(
-                self.hubert_model,
-                self.wav2vec2_processor,
-                speech_tensor,  # Pass 2D tensor [1, T] on device
-                device=self.device
-            )
-
-    def _compute_full_audio_features(
-        self,
-        audio_float: np.ndarray,
-        sample_rate: int,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Compute mel and optional HuBERT features for the full audio context.
-        
-        CRITICAL: audio_float should be UNNORMALIZED (raw int16 values as floats).
-        Official test_custom_aud does NOT normalize audio (opt.audio_norm = False).
-        It converts: int16 -> float32 without dividing by 32768.
-        
-        In NON_STREAMING_SANITY_CHECK mode, this always uses the FULL audio passed in.
-        In streaming mode, this uses audio from 0 to current window end.
-        """
-        if audio_float.size == 0:
-            return None, None
-
-        # Audio is already in the correct format (unnormalized float32)
-        raw_audio = np.asarray(audio_float, dtype=np.float32)
-
-
-        # Resample to 18kHz
-        try:
-            audio_18k = librosa.resample(raw_audio, orig_sr=sample_rate, target_sr=self.mel_sample_rate)
-        except Exception as exc:  # pragma: no cover - defensive guard
-            self.logger.error(f"Failed to resample audio to {self.mel_sample_rate} Hz: {exc}")
-            return None, None
-
-        # === FIX #2: Compute mel spectrogram with EXACT official trimming ===
-        # Official code (runner.py test_custom_aud, line ~1244-1249):
-        #   mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
-        #   mel = mel[..., :-1]  # UNCONDITIONALLY remove last frame
-        mel_full = librosa.feature.melspectrogram(
-            y=audio_18k,
-            sr=self.mel_sample_rate,
-            hop_length=self.mel_hop_length,
-            n_mels=self.mel_num_mels,
-        )
-        mel_full = mel_full.astype(np.float32, copy=False)
-        
-        # UNCONDITIONALLY remove last frame (matching official code exactly)
-        mel_full = mel_full[..., :-1]
-        
-        # Handle empty mel case (shouldn't happen with proper audio length)
-        if mel_full.shape[1] == 0:
-            self.logger.warning("Mel spectrogram empty after trimming; returning None")
-            return None, None
-
-        # Transpose to [T, 128] (official: np.swapaxes(mel, -1, -2))
-        mel_swapped = np.swapaxes(mel_full, -1, -2)
-        mel_swapped = np.ascontiguousarray(mel_swapped, dtype=np.float32)
-        audio_emb_full = torch.from_numpy(mel_swapped).unsqueeze(0).to(self.device)
-
-        hubert_feat_full: Optional[torch.Tensor] = None
-        if self.use_hubert and self.hubert_model is not None:
-            # Official function expects numpy array (1D)
-            hubert_feat_full = self._get_hubert_from_16k_speech(raw_audio)
-            if hubert_feat_full is not None:
-                # hubert_feat_full is on CPU, shape [T_hubert, 1024]
-                # Move to device and reshape for interpolation
-                hubert_feat_full = hubert_feat_full.to(self.device)
-                hubert_feat_full = hubert_feat_full.swapaxes(-1, -2).unsqueeze(0)  # [1, 1024, T_hubert]
-                hubert_feat_full = F.interpolate(
-                    hubert_feat_full,
-                    size=audio_emb_full.shape[1],
-                    mode="linear",
-                    align_corners=True,
-                )
-                hubert_feat_full = hubert_feat_full.swapaxes(-1, -2)  # [1, T_mel, 1024]
-
-        return audio_emb_full.float(), None if hubert_feat_full is None else hubert_feat_full.float()
-
-    
     def _generate_gesture_window_from_audio(
         self, 
-        audio_bytes_full: bytes,
+        audio_bytes_truncated: bytes,
         window_start_sample: int,
         window_end_sample: int,
         sample_rate: int,
@@ -1249,30 +904,30 @@ class DiffSHEGRealtimeWrapper:
         utterance_id: int
     ) -> List[GestureWaypoint]:
         """
-        Generate gestures for a window of audio using FULL audio context.
+        Generate gestures for a single window using official DiffSHEG pipeline.
         
-        CRITICAL FIXES applied to match official DiffSHEG behavior:
-        1. NO audio normalization (official: opt.audio_norm = False)
-        2. UNCONDITIONAL mel trimming: mel[..., :-1]
-        3. Correct frame/sample index conversion (mel FPS == gesture FPS == 15)
+        This method implements the EXACT official generation code from 
+        trainers/ddpm_beat_trainer.py::test_custom_aud(), adapted for single-window generation.
         
-        Official DiffSHEG pattern:
-        1. Extract mel/HuBERT features from FULL audio (0 to window_end_sample)
-        2. Window the features to get the current window
-        3. Generate gestures for the windowed features
+        KEY STRATEGY FOR STREAMING:
+        - audio_bytes_truncated contains audio from [0, window_end_sample]
+        - We compute mel/HuBERT features for this truncated audio (as if no future audio exists)
+        - We then window these features to extract the current window portion
+        - This ensures temporal consistency while enabling streaming
         
-        This method does NOT hold the utterance lock during generation.
-        It works with snapshots taken from the utterance.
-        
-        Frames are gesture poses indexed at gesture_fps (e.g., 15 FPS for BEAT dataset).
-        Each frame represents one gesture pose at a specific point in time.
-        Frame timing: frame_index = (sample_index / sample_rate) * gesture_fps
-        Example: at 16000 Hz and 15 FPS, frame 0 = sample 0, frame 1 = sample 1067, etc.
+        Official DiffSHEG pipeline:
+        1. Convert audio bytes to float32 (normalized to [-1, 1])
+        2. Resample to 18kHz for mel spectrogram
+        3. Extract mel: librosa.feature.melspectrogram(...) then mel[..., :-1]
+        4. Extract HuBERT if enabled: get_hubert_from_16k_speech_long(...) then interpolate
+        5. Window the features to get current window (window_size frames)
+        6. Generate with trainer.generate_batch() using inpainting for overlap
         
         Args:
-            audio_bytes_full: Raw audio bytes from start to window_end_sample (s16le encoded)
+            audio_bytes_truncated: Raw audio bytes from [0, window_end_sample] (s16le encoded)
+                                   This "pretends" that the audio only extends to window_end
             window_start_sample: Starting sample index of this window in the full utterance
-            window_end_sample: Ending sample index of this window in the full utterance
+            window_end_sample: Ending sample index of this window (where audio is truncated)
             sample_rate: Audio sample rate (e.g., 16000 Hz)
             gesture_fps: Gesture frame rate (e.g., 15 FPS for BEAT)
             overlap_context: Optional list of gesture data arrays from previous window's last frames
@@ -1282,128 +937,127 @@ class DiffSHEGRealtimeWrapper:
         Returns:
             List of generated waypoints (only the non-overlapping window_step frames)
         """
-        if len(audio_bytes_full) == 0:
+        if len(audio_bytes_truncated) == 0:
             return []
         
-        # Convert raw bytes to float32 audio for processing
-        # DO NOT NORMALIZE: Official test_custom_aud converts int16 to float32 without normalization
-        # This matches: aud = np.asarray(aud * 32767, dtype=np.int16); aud = np.asarray(aud, dtype=np.float32)
-        audio_int16 = np.frombuffer(audio_bytes_full, dtype=np.int16)
+        # ===== STEP 1: Convert audio bytes to normalized float32 (official format) =====
+        audio_int16 = np.frombuffer(audio_bytes_truncated, dtype=np.int16)
         if audio_int16.size == 0:
             return []
-        audio_float = audio_int16.astype(np.float32)
-
-        # Extract full-context audio embeddings (mel + optional HuBERT)
-        audio_emb_full, hubert_feat_full = self._compute_full_audio_features(audio_float, sample_rate)
-        if audio_emb_full is None or audio_emb_full.shape[1] == 0:
-            self.logger.warning(
-                f"Utterance {utterance_id} audio features unavailable (frames={0 if audio_emb_full is None else audio_emb_full.shape[1]}); skipping window."
+        # Normalize to [-1, 1] (official code does this for librosa processing)
+        aud_ori = audio_int16.astype(np.float32) / 32768.0
+        
+        # ===== STEP 2: Resample to 18kHz (official mel extraction) =====
+        aud = librosa.resample(aud_ori, orig_sr=sample_rate, target_sr=18000)
+        
+        # ===== STEP 3: Extract mel spectrogram (EXACT official code) =====
+        mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
+        mel = mel[..., :-1]  # CRITICAL: Always remove last frame (official code line 1249)
+        audio_emb = torch.from_numpy(np.swapaxes(mel, -1, -2))  # [T, 128]
+        audio_emb = audio_emb.unsqueeze(0).to(self.device)  # [1, T, 128]
+        
+        # ===== STEP 4: Extract HuBERT features if enabled (EXACT official code) =====
+        add_cond = {}
+        if self.opt.expAddHubert or self.opt.addHubert:
+            # Use official function from trainers.ddpm_beat_trainer
+            hubert_feat = get_hubert_from_16k_speech_long(
+                self.hubert_model,
+                self.wav2vec2_processor,
+                torch.from_numpy(aud_ori).unsqueeze(0).to(self.device),
+                device=self.device
             )
-            return []
-
-        # === FIX #1: Convert sample indices to frame indices ===
-        # Since mel frame rate (18000/1200 = 15 FPS) equals gesture FPS (15 FPS),
-        # we can use gesture frame indices directly to index mel features
+            # Interpolate to match mel length
+            hubert_feat = F.interpolate(
+                hubert_feat.swapaxes(-1,-2).unsqueeze(0),
+                size=audio_emb.shape[1],
+                mode='linear',
+                align_corners=True
+            ).swapaxes(-1,-2)  # [1, T, 1024]
+            add_cond["pretrain_aud_feat"] = hubert_feat.to(self.device)
+        
+        # ===== STEP 5: Window the features to get current window portion =====
         window_start_frame = int(round(window_start_sample / sample_rate * gesture_fps))
-        full_audio_duration = audio_float.shape[0] / sample_rate
-        self.logger.debug(
-            f"Utterance {utterance_id} window start={window_start_frame}, audio={full_audio_duration:.3f}s, hubert={hubert_feat_full is not None}"
-        )
-
-        # Window the mel features using frame indices
-        # This is correct because mel FPS == gesture FPS == 15
-        mel_window_start = max(0, window_start_frame)
+        
+        # Extract window from full features (features span [0, window_end_sample])
+        mel_window_start = window_start_frame
         mel_window_end = mel_window_start + self.window_size
-
-        audio_window = audio_emb_full[:, mel_window_start:mel_window_end, :]
+        
+        audio_window = audio_emb[:, mel_window_start:mel_window_end, :]
+        
+        # Pad or trim to exact window_size
         if audio_window.shape[1] < self.window_size:
             pad_frames = self.window_size - audio_window.shape[1]
-            pad = audio_emb_full.new_zeros((1, pad_frames, audio_emb_full.shape[2]))
-            audio_window = torch.cat([audio_window, pad], dim=1)
+            audio_window = F.pad(audio_window, (0, 0, 0, pad_frames), value=0)
         elif audio_window.shape[1] > self.window_size:
             audio_window = audio_window[:, :self.window_size, :]
-
-        audio_window = audio_window.contiguous()
-        B, T, _ = audio_window.shape
-        C = self.opt.net_dim_pose
-        motions = audio_window.new_zeros((B, T, C))
-
-        p_id = torch.zeros((1, 1), device=self.device) + 2 ## Use pid 2
-        p_id = self.model.one_hot(p_id, self.opt.speaker_dim).to(self.device)
         
-
-        add_cond: Dict[str, torch.Tensor] = {}
-        if hubert_feat_full is not None:
-            hubert_window = hubert_feat_full[:, mel_window_start:mel_window_end, :]
+        audio_window = audio_window.contiguous()  # [1, window_size, 128]
+        
+        # Window HuBERT features similarly if present
+        if "pretrain_aud_feat" in add_cond:
+            hubert_window = add_cond["pretrain_aud_feat"][:, mel_window_start:mel_window_end, :]
             if hubert_window.shape[1] < self.window_size:
                 pad_frames = self.window_size - hubert_window.shape[1]
-                pad = hubert_feat_full.new_zeros((1, pad_frames, hubert_window.shape[2]))
-                hubert_window = torch.cat([hubert_window, pad], dim=1)
+                hubert_window = F.pad(hubert_window, (0, 0, 0, pad_frames), value=0)
             elif hubert_window.shape[1] > self.window_size:
                 hubert_window = hubert_window[:, :self.window_size, :]
             add_cond["pretrain_aud_feat"] = hubert_window.contiguous()
-            self.logger.debug(
-                f"Utterance {utterance_id} HuBERT window frames={hubert_window.shape[1]}"
-            )
-
-        # Inpainting for overlap - use overlap context from previous window for smooth transitions
-        inpaint_dict = {}
-        if overlap_context is not None and len(overlap_context) == self.overlap_len:
-            inpaint_dict['gt'] = motions.new_zeros(motions.shape)
-            inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
-            inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
-
-            prev_frames_np = np.stack(overlap_context).astype(np.float32)
-            prev_frames = torch.from_numpy(prev_frames_np).unsqueeze(0).to(self.device)
-            inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames
-        elif window_start_frame == 0 and self.opt.fix_very_first:
-            # === FIX: Match official behavior for the very first window ===
-            # When opt.fix_very_first is True, the official code conditions the first overlap_len frames
-            # on neutral pose (zeros in normalized space) to prevent random initialization and reduce jitter.
-            # See official test_custom_aud() around line 1290-1295 in ddpm_beat_trainer.py
-            self.logger.debug(f"Utterance {utterance_id}: First window with fix_very_first=True. "
-                             f"Conditioning first {self.overlap_len} frames on neutral pose.")
-            inpaint_dict['gt'] = motions.new_zeros(motions.shape)
-            inpaint_dict['outpainting_mask'] = torch.zeros_like(motions, dtype=torch.bool, device=self.device)
-            # Condition the first overlap_len frames on neutral pose (all zeros)
-            inpaint_dict['gt'][:, :self.overlap_len, :] = 0
-            inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
         
-        # Generate gestures (no lock held during model inference)
+        # ===== STEP 6: Prepare motion tensor and person ID =====
+        B, T, _ = audio_window.shape
+        C = self.opt.net_dim_pose
+        motions = torch.zeros((B, T, C), device=self.device)
+        
+        # Person ID (use ID 2, index 1 - same as official test_custom_aud)
+        p_id = torch.ones((1, 1), device=self.device) * 1  # pid 2 - 1 = 1
+        p_id = self.model.one_hot(p_id, self.opt.speaker_dim).to(self.device)
+        
+        # ===== STEP 7: Prepare inpainting dict for overlap (EXACT official code) =====
+        inpaint_dict = {}
+        if self.overlap_len > 0:
+            inpaint_dict['gt'] = torch.zeros_like(motions)
+            inpaint_dict['outpainting_mask'] = torch.zeros_like(
+                motions, dtype=torch.bool, device=self.device
+            )
+            
+            if window_start_frame == 0:
+                # First window: apply fix_very_first if enabled
+                if self.opt.fix_very_first:
+                    inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
+                    inpaint_dict['gt'][:, :self.overlap_len, :] = 0  # Condition on neutral pose
+            else:
+                # Subsequent windows: use overlap context from previous window
+                if overlap_context is not None and len(overlap_context) == self.overlap_len:
+                    inpaint_dict['outpainting_mask'][:, :self.overlap_len, :] = True
+                    prev_frames_np = np.stack(overlap_context).astype(np.float32)
+                    prev_frames = torch.from_numpy(prev_frames_np).unsqueeze(0).to(self.device)
+                    inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames
+        
+        # ===== STEP 8: Generate using official trainer method =====
         with torch.no_grad():
             outputs = self.model.generate_batch(
                 audio_window, p_id, C, add_cond, inpaint_dict
             )
         
-        outputs_np = outputs.cpu().numpy()[0]  # Shape: (window_size, C)
+        outputs_np = outputs.cpu().numpy()[0]  # [window_size, C]
         
-        # === DIAGNOSTIC LOGGING ===
-        outputs_min = outputs_np.min()
-        outputs_max = outputs_np.max()
-        outputs_mean = outputs_np.mean()
-        outputs_std = outputs_np.std()
-        self.logger.info(
-            f"Utterance {utterance_id} window {window_start_frame} model output stats: "
-            f"min={outputs_min:.3f}, max={outputs_max:.3f}, "
-            f"mean={outputs_mean:.3f}, std={outputs_std:.3f}, "
-            f"has_inpaint={len(inpaint_dict)>0}"
-        )
-        
-        # Create waypoints from the generated gestures
-        # Only create waypoints for the non-overlapping part (window_step frames)
+        # ===== STEP 9: Create waypoints (only non-overlapping window_step frames) =====
         waypoints = []
         for i in range(self.window_step):
             frame_index = window_start_frame + i
-            timestamp = frame_index / gesture_fps  # Time in seconds from utterance start
+            timestamp = frame_index / gesture_fps
             
             waypoint = GestureWaypoint(
                 waypoint_index=frame_index,
                 timestamp=timestamp,
-                gesture_data=outputs_np[i]  # Shape: (C,)
+                gesture_data=outputs_np[i]  # [C,]
             )
             waypoints.append(waypoint)
         
-        self.logger.debug(f"Utterance {utterance_id} window generation complete: created {len(waypoints)} waypoints (frames {window_start_frame}-{window_start_frame + self.window_step - 1})")
+        self.logger.debug(
+            f"Utterance {utterance_id} window {window_start_frame}: "
+            f"generated {len(waypoints)} waypoints"
+        )
         return waypoints
 
     
