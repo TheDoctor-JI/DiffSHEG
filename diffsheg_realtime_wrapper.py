@@ -906,12 +906,17 @@ class DiffSHEGRealtimeWrapper:
         """
         Compute mel and optional HuBERT features for the full audio context.
         
+        CRITICAL: audio_float should be UNNORMALIZED (raw int16 values as floats).
+        Official test_custom_aud does NOT normalize audio (opt.audio_norm = False).
+        It converts: int16 -> float32 without dividing by 32768.
+        
         In NON_STREAMING_SANITY_CHECK mode, this always uses the FULL audio passed in.
         In streaming mode, this uses audio from 0 to current window end.
         """
         if audio_float.size == 0:
             return None, None
 
+        # Audio is already in the correct format (unnormalized float32)
         raw_audio = np.asarray(audio_float, dtype=np.float32)
 
 
@@ -1011,10 +1016,12 @@ class DiffSHEGRealtimeWrapper:
             return []
         
         # Convert raw bytes to float32 audio for processing
+        # DO NOT NORMALIZE: Official test_custom_aud converts int16 to float32 without normalization
+        # This matches: aud = np.asarray(aud * 32767, dtype=np.int16); aud = np.asarray(aud, dtype=np.float32)
         audio_int16 = np.frombuffer(audio_bytes_full, dtype=np.int16)
         if audio_int16.size == 0:
             return []
-        audio_float = audio_int16.astype(np.float32) / 32768.0
+        audio_float = audio_int16.astype(np.float32)
 
         # Extract full-context audio embeddings (mel + optional HuBERT)
         audio_emb_full, hubert_feat_full = self._compute_full_audio_features(audio_float, sample_rate)
