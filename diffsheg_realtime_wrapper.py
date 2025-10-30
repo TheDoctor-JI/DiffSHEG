@@ -53,6 +53,36 @@ try:
 except ImportError:
     get_hubert_from_16k_speech_long = None
 
+@dataclass
+class GestureWaypoint:
+    """
+    Represents a single gesture frame at a specific timestamp.
+    
+    Each waypoint contains the gesture data for ONE frame (not a window).
+    """
+    waypoint_index: int  # Sequential frame index (0, 1, 2, ...)
+    timestamp: float  # Time in seconds from utterance start when this frame should be executed
+    gesture_data: np.ndarray  # Gesture pose vector of shape (C,) for this single frame
+    is_for_execution: bool = True  # True if this frame should be executed, False if only for inpainting context
+
+
+@dataclass
+class WaypointWindow:
+    """
+    Represents one window generation containing multiple waypoints.
+    
+    For BEAT with window_size=34, overlap_len=4, window_step=30:
+    - execution_waypoints: First 30 waypoints (frames 0-29) - executed and exported
+    - context_waypoints: Last 4 waypoints (frames 30-33) - used for next window's inpainting
+    
+    The window generates 34 total waypoints but only the first 30 are for execution.
+    """
+    window_index: int  # Sequential window index (0, 1, 2, ...)
+    execution_waypoints: List[GestureWaypoint]  # Waypoints for execution (window_step frames)
+    context_waypoints: List[GestureWaypoint]  # Waypoints for next window's inpainting (overlap_len frames)
+
+
+
 
 class Utterance:
     """Tracks an ongoing or completed utterance with audio stored as concatenated samples."""
@@ -63,13 +93,11 @@ class Utterance:
         sample_rate: int,
         gesture_fps: int,
         window_size: int,
-        window_step: int,
-        gesture_waypoints: 'GestureWaypoints'
+        window_step: int
     ):
         self.utterance_id = utterance_id
         self.start_time: Optional[float] = None
         self.last_chunk_received_time: float = None # Track when last chunk arrived
-        self.gesture_waypoints = gesture_waypoints  # Gesture waypoints for this utterance
         
         # Audio storage: concatenated samples instead of chunks
         self.sample_rate = sample_rate
@@ -86,6 +114,12 @@ class Utterance:
         
         self.next_window_start_sample: int = 0
         self.next_window_end_sample: int = window_duration_samples
+        
+        # Gesture data structures
+        self.windows: List[WaypointWindow] = []  # All generated windows
+        self.execution_waypoints: List[GestureWaypoint] = []  # Flat list of waypoints for execution (only is_for_execution=True)
+        self.last_executed_waypoint_index: int = -1  # Cursor for playback
+        self.waypoints_lock = threading.Lock()
     
     def add_audio_samples(self, audio_data):
         """
@@ -138,48 +172,13 @@ class Utterance:
         
         self.next_window_start_sample += step_duration_samples
         self.next_window_end_sample = self.next_window_start_sample + window_duration_samples
-
-
-@dataclass
-class GestureWaypoint:
-    """
-    Represents a gesture window with execution data and overlap context.
     
-    Each waypoint corresponds to one window generation and contains:
-    - execution_data: The non-overlapping frames (window_step frames) to actually execute/export
-    - overlap_context: The last overlap_len frames from the full window for next window's inpainting
-    
-    For BEAT with window_size=34, overlap_len=4, window_step=30:
-    - execution_data: frames 0-29 (30 frames) - these are executed and exported
-    - overlap_context: frames 30-33 (4 frames) - used for next window's smooth transition
-    """
-    waypoint_index: int  # Sequential window index (0, 1, 2, ...)
-    timestamp: float  # Time in seconds from utterance start when this window starts
-    execution_data: np.ndarray  # Execution frames of shape (window_step, C) - frames to actually execute
-    overlap_context: Optional[np.ndarray] = None  # Last overlap_len frames of shape (overlap_len, C) for next window
-
-
-class GestureWaypoints:
-    """
-    Manages gesture waypoints for an utterance.
-    
-    Waypoints are generated at gesture_fps (15 FPS for BEAT), meaning one waypoint
-    every ~66.67ms. The playback thread checks every 10ms if any waypoint should
-    be executed in the upcoming interval.
-    """
-    
-    def __init__(self, gesture_fps: int = 15):
-        self.gesture_fps = gesture_fps
-        self.waypoints: List[GestureWaypoint] = []
-        self.last_executed_index: int = -1  # Track which waypoint was last executed
-        self.lock = threading.Lock()
-    
-    def add_waypoints(self, waypoints: List[GestureWaypoint]):
-        """Add new waypoints (from generation thread)."""
-        with self.lock:
-            self.waypoints.extend(waypoints)
-            # Keep waypoints sorted by timestamp
-            self.waypoints.sort(key=lambda w: w.timestamp)
+    def add_window(self, window: WaypointWindow):
+        """Add a generated window and extract execution waypoints."""
+        with self.waypoints_lock:
+            self.windows.append(window)
+            # Add all execution waypoints to the flat list for playback
+            self.execution_waypoints.extend(window.execution_waypoints)
     
     def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
@@ -191,23 +190,22 @@ class GestureWaypoints:
             
         Returns:
             The waypoint to execute, or None if no waypoint falls in this interval.
-            At most one waypoint per interval since waypoints are at 15 FPS (~66.67ms apart).
         """
-        with self.lock:
-            if not self.waypoints:
+        with self.waypoints_lock:
+            if not self.execution_waypoints:
                 return None
             
             interval_end = current_time + interval_duration
             
             # Search from the last executed waypoint onwards
-            search_start = self.last_executed_index + 1
+            search_start = self.last_executed_waypoint_index + 1
             
-            for i in range(search_start, len(self.waypoints)):
-                waypoint = self.waypoints[i]
+            for i in range(search_start, len(self.execution_waypoints)):
+                waypoint = self.execution_waypoints[i]
                 
                 # Check if this waypoint falls within the upcoming interval
                 if current_time <= waypoint.timestamp < interval_end:
-                    self.last_executed_index = i
+                    self.last_executed_waypoint_index = i
                     return waypoint
                 
                 # If waypoint is beyond the interval, we can stop searching
@@ -215,10 +213,8 @@ class GestureWaypoints:
                     break
             
             return None
-    
-    def get_total_waypoints(self):
-        with self.lock:
-            return len(self.waypoints)
+
+
 
 class DiffSHEGRealtimeWrapper:
     """
@@ -466,8 +462,7 @@ class DiffSHEGRealtimeWrapper:
                     sample_rate=self.audio_sr,
                     gesture_fps=self.gesture_fps,
                     window_size=self.window_size,
-                    window_step=self.window_step,
-                    gesture_waypoints=GestureWaypoints(gesture_fps=self.gesture_fps)
+                    window_step=self.window_step
                 )
                 self.logger.info(f"New utterance created: id={utterance_id}")
             
@@ -591,17 +586,16 @@ class DiffSHEGRealtimeWrapper:
                         should_cleanup = True
                 
                 # Check for waypoint to execute in the next 10ms interval
-                if utterance.gesture_waypoints is not None:
-                    waypoint = utterance.gesture_waypoints.get_waypoint_for_interval(
-                        current_time=elapsed_time,
-                        interval_duration=interval_duration
-                    )
-                    if waypoint is not None:
-                        # Execute waypoint gesture
-                        self.logger.debug(f"Utterance {utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
-                        # Call the waypoint callback if provided
-                        if self.waypoint_callback is not None:
-                            self.waypoint_callback(waypoint)
+                waypoint = utterance.get_waypoint_for_interval(
+                    current_time=elapsed_time,
+                    interval_duration=interval_duration
+                )
+                if waypoint is not None:
+                    # Execute waypoint gesture
+                    self.logger.debug(f"Utterance {utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
+                    # Call the waypoint callback if provided
+                    if self.waypoint_callback is not None:
+                        self.waypoint_callback(waypoint)
             
             if should_cleanup:
                 self._cleanup_current_utterance()
@@ -781,7 +775,7 @@ class DiffSHEGRealtimeWrapper:
             
             # Generate this window using precomputed features
             # Pass empty bytes since we're using precomputed features
-            waypoints = self._generate_gesture_window_from_audio(
+            window = self._generate_gesture_window_from_audio(
                 b'',  # Not used when precomputed features are provided
                 window_start_sample,
                 min(window_end_sample, total_samples),
@@ -793,19 +787,21 @@ class DiffSHEGRealtimeWrapper:
                 precomputed_hubert=hubert_feat
             )
             
-            all_waypoints.extend(waypoints)
+            if window is None:
+                break
             
-            # Collect execution data for export (only non-overlapping frames)
-            # Each waypoint contains execution_data with shape (window_step, C)
-            for wp in waypoints:
-                all_window_outputs.append(wp.execution_data)  # Shape: (window_step, C)
+            # Collect execution waypoints for export
+            all_waypoints.extend(window.execution_waypoints)
             
-            # Update overlap context for next window using the CORRECT last 4 frames
-            if waypoints and self.overlap_len > 0 and waypoints[0].overlap_context is not None:
-                # Use overlap_context from the waypoint (these are frames 30-33 of the 34-frame window)
-                # Convert from (overlap_len, C) to list of arrays for consistency
-                overlap_context = [waypoints[0].overlap_context[i].copy() for i in range(self.overlap_len)]
-                self.logger.debug(f"[SANITY CHECK] Updated overlap context with {len(overlap_context)} frames from window output")
+            # Collect gesture data from execution waypoints for export
+            execution_data = np.array([wp.gesture_data for wp in window.execution_waypoints])  # Shape: (window_step, C)
+            all_window_outputs.append(execution_data)
+            
+            # Update overlap context for next window using context waypoints
+            if self.overlap_len > 0 and window.context_waypoints:
+                # Extract gesture data from context waypoints (frames 30-33 of the window)
+                overlap_context = [wp.gesture_data.copy() for wp in window.context_waypoints]
+                self.logger.debug(f"[SANITY CHECK] Updated overlap context with {len(overlap_context)} frames from window {window.window_index}")
             
             # Advance window
             window_start_sample += int((self.window_step / gesture_fps) * sample_rate)
@@ -912,23 +908,19 @@ class DiffSHEGRealtimeWrapper:
                 window_start_frame = int(window_start_sample / sample_rate * gesture_fps)
                 
                 if self.overlap_len > 0 and window_start_frame > 0:
-                    # We need overlap context from the previous window's last frames
-                    if utterance.gesture_waypoints is not None:
-                        with utterance.gesture_waypoints.lock:
-                            # Find the most recent waypoint (should be the previous window)
-                            if utterance.gesture_waypoints.waypoints:
-                                prev_waypoint = utterance.gesture_waypoints.waypoints[-1]
-                                # Use the overlap_context from previous waypoint (frames 30-33 of that window)
-                                if prev_waypoint.overlap_context is not None:
-                                    # Convert from (overlap_len, C) to list of arrays
-                                    overlap_context = [prev_waypoint.overlap_context[i].copy() for i in range(self.overlap_len)]
-                                    self.logger.debug(f"Utterance {utterance_id} using overlap context from previous waypoint {prev_waypoint.waypoint_index}")
+                    # We need overlap context from the previous window's context waypoints
+                    if utterance.windows:
+                        prev_window = utterance.windows[-1]
+                        # Use the context waypoints from previous window (frames 30-33)
+                        if prev_window.context_waypoints:
+                            overlap_context = [wp.gesture_data.copy() for wp in prev_window.context_waypoints]
+                            self.logger.debug(f"Utterance {utterance_id} using overlap context from previous window {prev_window.window_index}")
             
             # Step 2: Generate gestures without holding the lock
             if should_generate and len(audio_snapshot_full) > 0:
                 # Generate gestures for this window
                 gen_start_time = time.time()
-                waypoints = self._generate_gesture_window_from_audio(
+                window = self._generate_gesture_window_from_audio(
                     audio_snapshot_full,  # Pass full audio context
                     window_start_sample,
                     window_end_sample,
@@ -938,22 +930,23 @@ class DiffSHEGRealtimeWrapper:
                     utterance_id
                 )
                 gen_duration = time.time() - gen_start_time
-                self.logger.debug(f"Utterance {utterance_id} generation completed: {len(waypoints)} waypoints in {gen_duration:.3f}s")
+                if window:
+                    self.logger.debug(f"Utterance {utterance_id} generation completed: window {window.window_index} with {len(window.execution_waypoints)} execution waypoints in {gen_duration:.3f}s")
                 
-                # Step 3: Write waypoints back and update generation state
+                # Step 3: Write window back and update generation state
                 with self.utterance_lock:
                     utterance = self.current_utterance
                     
                     # Check if this utterance is still current (not cancelled)
                     if utterance is None or utterance.utterance_id != utterance_id:
-                        # Utterance was cancelled, discard waypoints
-                        self.logger.debug(f"Utterance {utterance_id} was cancelled during generation, discarding {len(waypoints)} waypoints")
+                        # Utterance was cancelled, discard window
+                        self.logger.debug(f"Utterance {utterance_id} was cancelled during generation, discarding window")
                         continue
                     
-                    # Write waypoints
-                    if waypoints and utterance.gesture_waypoints is not None:
-                        utterance.gesture_waypoints.add_waypoints(waypoints)
-                        self.logger.debug(f"Utterance {utterance_id} waypoints written: {len(waypoints)} waypoints added, total={utterance.gesture_waypoints.get_total_waypoints()}")
+                    # Add window to utterance (this also adds execution waypoints to flat list)
+                    if window:
+                        utterance.add_window(window)
+                        self.logger.debug(f"Utterance {utterance_id} window {window.window_index} added: total windows={len(utterance.windows)}, total execution waypoints={len(utterance.execution_waypoints)}")
                     
                     # Update window indices for next generation
                     prev_window_end = utterance.next_window_end_sample
@@ -971,7 +964,7 @@ class DiffSHEGRealtimeWrapper:
         utterance_id: int,
         precomputed_mel: Optional[torch.Tensor] = None,
         precomputed_hubert: Optional[torch.Tensor] = None
-    ) -> List[GestureWaypoint]:
+    ) -> WaypointWindow:
         """
         Generate gestures for a single window using official DiffSHEG pipeline.
         
@@ -1012,10 +1005,10 @@ class DiffSHEGRealtimeWrapper:
             precomputed_hubert: Optional precomputed HuBERT features [1, T, 1024] for non-streaming mode
         
         Returns:
-            List of generated waypoints (only the non-overlapping window_step frames)
+            WaypointWindow containing execution waypoints and context waypoints
         """
         if len(audio_bytes_truncated) == 0 and precomputed_mel is None:
-            return []
+            return None
         
         # ===== STEP 1-4: Extract or use precomputed features =====
         if precomputed_mel is not None:
@@ -1096,27 +1089,50 @@ class DiffSHEGRealtimeWrapper:
         
         outputs_np = outputs.cpu().numpy()[0]  # [window_size, C] - FULL window output
         
-        # ===== STEP 9: Split into execution data and overlap context =====
-        # Execution data: first window_step frames (non-overlapping frames for export)
-        execution_frames = outputs_np[:self.window_step]  # [window_step, C] - frames 0-29
+        # ===== STEP 9: Create individual waypoints for each frame =====
+        execution_waypoints = []
+        context_waypoints = []
         
-        # Overlap context: last overlap_len frames (for next window's inpainting)
-        overlap_frames = outputs_np[-self.overlap_len:] if self.overlap_len > 0 else None  # [overlap_len, C] - frames 30-33
+        # Create execution waypoints (first window_step frames)
+        for i in range(self.window_step):
+            frame_index = window_start_frame + i
+            timestamp = frame_index / gesture_fps
+            
+            waypoint = GestureWaypoint(
+                waypoint_index=frame_index,
+                timestamp=timestamp,
+                gesture_data=outputs_np[i],  # [C,] - single frame
+                is_for_execution=True
+            )
+            execution_waypoints.append(waypoint)
         
-        # Create single waypoint representing this window
-        waypoint = GestureWaypoint(
-            waypoint_index=window_start_frame,
-            timestamp=window_start_frame / gesture_fps,
-            execution_data=execution_frames,  # [window_step, C]
-            overlap_context=overlap_frames     # [overlap_len, C] or None
+        # Create context waypoints (last overlap_len frames)
+        if self.overlap_len > 0:
+            for i in range(self.overlap_len):
+                frame_index = window_start_frame + self.window_step + i
+                timestamp = frame_index / gesture_fps
+                
+                waypoint = GestureWaypoint(
+                    waypoint_index=frame_index,
+                    timestamp=timestamp,
+                    gesture_data=outputs_np[self.window_step + i],  # [C,] - single frame
+                    is_for_execution=False  # Context only, not for execution
+                )
+                context_waypoints.append(waypoint)
+        
+        # Create window containing all waypoints
+        window_idx = window_start_frame // self.window_step
+        window = WaypointWindow(
+            window_index=window_idx,
+            execution_waypoints=execution_waypoints,
+            context_waypoints=context_waypoints
         )
         
         self.logger.debug(
-            f"Utterance {utterance_id} window {window_start_frame}: "
-            f"generated waypoint with execution_data shape={execution_frames.shape}, "
-            f"overlap_context shape={overlap_frames.shape if overlap_frames is not None else None}"
+            f"Utterance {utterance_id} window {window_idx}: "
+            f"generated {len(execution_waypoints)} execution waypoints + {len(context_waypoints)} context waypoints"
         )
-        return [waypoint]  # Return as list for consistency with old interface
+        return window
 
     
 
