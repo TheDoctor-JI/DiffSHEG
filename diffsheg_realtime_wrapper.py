@@ -730,6 +730,7 @@ class DiffSHEGRealtimeWrapper:
         
         # Generate all windows
         all_waypoints = []
+        all_window_outputs = []  # Collect raw outputs for export
         overlap_context = None
         
         window_start_sample = 0
@@ -755,6 +756,11 @@ class DiffSHEGRealtimeWrapper:
             
             all_waypoints.extend(waypoints)
             
+            # Collect gesture data for export (only non-overlapping frames)
+            # Each waypoint contains gesture_data with shape (C,) where C = net_dim_pose (192 for gesture+expression)
+            window_gesture_data = np.array([wp.gesture_data for wp in waypoints])  # Shape: (window_step, C)
+            all_window_outputs.append(window_gesture_data)
+            
             # Update overlap context for next window
             if waypoints and self.overlap_len > 0:
                 # Get last overlap_len waypoints as context for next window
@@ -769,6 +775,16 @@ class DiffSHEGRealtimeWrapper:
             f"[SANITY CHECK] Generated {len(all_waypoints)} total waypoints "
             f"from {window_idx} windows"
         )
+        
+        # Concatenate all window outputs and store for export (matching reference pipeline)
+        if all_window_outputs:
+            out_motions = np.concatenate(all_window_outputs, axis=0)  # Shape: (T, C)
+            out_motions = np.expand_dims(out_motions, axis=0)  # Shape: (1, T, C) to match reference pipeline
+            self.last_generated_motion = torch.from_numpy(out_motions)
+            self.logger.info(f"[SANITY CHECK] Stored generated motion for export: shape={out_motions.shape}")
+        else:
+            self.last_generated_motion = None
+            self.logger.warning("[SANITY CHECK] No window outputs generated, cannot store motion for export")
         
         # Execute all waypoints through callback BEFORE signaling completion
         if self.waypoint_callback is not None:

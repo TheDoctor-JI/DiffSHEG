@@ -764,13 +764,15 @@ def main():
         print("\n[USE_SAME_EXPORT=True] Using official runner.py export logic...")
         
         # Get pre-generated motion from wrapper (if available) to avoid regeneration
+        # This works for both reference pipeline and wrapper's own pipeline
         pre_generated_motion = None
-        if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE:
+        if hasattr(wrapper, 'last_generated_motion') and wrapper.last_generated_motion is not None:
             pre_generated_motion = wrapper.last_generated_motion
-            if pre_generated_motion is not None:
-                print("[USE_SAME_EXPORT] Using pre-generated motion from wrapper (avoiding regeneration)")
-            else:
-                print("[USE_SAME_EXPORT] No pre-generated motion found, will run full generation")
+            pipeline_name = "REFERENCE" if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE else "WRAPPER"
+            print(f"[USE_SAME_EXPORT] Using pre-generated motion from {pipeline_name} pipeline (avoiding regeneration)")
+            print(f"[USE_SAME_EXPORT] Motion shape: {pre_generated_motion.shape}")
+        else:
+            print("[USE_SAME_EXPORT] No pre-generated motion found, will run full generation in export logic")
         
         gesture_dir, expression_dir = official_export_logic(
             audio_path=audio_path,
