@@ -48,7 +48,6 @@ import librosa
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger.logger import setup_logger
 
-# Import for reference pipeline (only needed when SANITY_CHECK_USE_REFERENCE_PIPELINE is enabled)
 try:
     from trainers.ddpm_beat_trainer import get_hubert_from_16k_speech_long
 except ImportError:
@@ -360,16 +359,10 @@ class DiffSHEGRealtimeWrapper:
         
         # Log mode information
         if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK:
-            if DiffSHEGRealtimeWrapper.SANITY_CHECK_USE_REFERENCE_PIPELINE:
-                self.logger.info("="*60)
-                self.logger.info("SANITY CHECK MODE: REFERENCE PIPELINE")
-                self.logger.info("Using EXACT same code as official runner.py")
-                self.logger.info("="*60)
-            else:
-                self.logger.info("="*60)
-                self.logger.info("SANITY CHECK MODE: NON-STREAMING")
-                self.logger.info("Using wrapper's own generation pipeline")
-                self.logger.info("="*60)
+            self.logger.info("="*60)
+            self.logger.info("SANITY CHECK MODE: NON-STREAMING")
+            self.logger.info("Using wrapper's own generation pipeline")
+            self.logger.info("="*60)
         else:
             self.logger.info("="*60)
             self.logger.info("STREAMING MODE: Real-time generation")

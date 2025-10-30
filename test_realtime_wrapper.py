@@ -328,6 +328,17 @@ def setup_beat_config(opt):
     opt.audio_norm = False
     opt.facial_norm = True
     opt.pose_norm = True
+    opt.train_data_path = f'data/BEAT/beat_cache/{opt.beat_cache_name}/train/'
+    opt.val_data_path = f'data/BEAT/beat_cache/{opt.beat_cache_name}/val/'
+    opt.test_data_path = f'data/BEAT/beat_cache/{opt.beat_cache_name}/test/'
+    opt.mean_pose_path = f'data/BEAT/beat_cache/{opt.beat_cache_name}/train/'
+    opt.std_pose_path = f'data/BEAT/beat_cache/{opt.beat_cache_name}/train/'
+    opt.multi_length_training = [1.0]
+    opt.audio_rep = 'wave16k'
+    opt.facial_rep = 'facial52'
+    opt.speaker_id = 'id'
+    opt.pose_rep = 'bvh_rot'
+    opt.word_rep = 'text'
     
     return opt
 
