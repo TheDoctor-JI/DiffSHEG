@@ -66,7 +66,7 @@ class WaypointCollector:
         self.waypoints.append({
             'index': waypoint.waypoint_index,
             'timestamp': waypoint.timestamp,  # Time in seconds from utterance start
-            'gesture_data': waypoint.gesture_data.copy()  # shape (192,)
+            'execution_data': waypoint.execution_data.copy()  # shape (window_step, 192) - frames to execute
         })
         
         # Track timing bounds
@@ -74,7 +74,7 @@ class WaypointCollector:
             self.first_timestamp = waypoint.timestamp
         self.last_timestamp = waypoint.timestamp
         
-        print(f"[WAYPOINT] Collected waypoint {waypoint.waypoint_index} at t={waypoint.timestamp:.3f}s - shape: {waypoint.gesture_data.shape}")
+        print(f"[WAYPOINT] Collected waypoint {waypoint.waypoint_index} at t={waypoint.timestamp:.3f}s - execution_data shape: {waypoint.execution_data.shape}")
     
     def save_to_files(self, output_dir, trainer, audio_duration):
         """
@@ -656,7 +656,7 @@ def main():
         collected_waypoints.append({
             'index': waypoint.waypoint_index,
             'timestamp': waypoint.timestamp,
-            'gesture_data': waypoint.gesture_data.copy()
+            'execution_data': waypoint.execution_data.copy()  # Now shape (window_step, C)
         })
 
     wrapper = DiffSHEGRealtimeWrapper(
@@ -745,8 +745,10 @@ def main():
         # Fallback: reconstruct from collected waypoints
         print(f"[EXPORT] Reconstructing motion from {len(collected_waypoints)} waypoints...")
         collected_waypoints.sort(key=lambda x: x['index'])
-        waypoint_data = [wp['gesture_data'] for wp in collected_waypoints]
-        out_motions = np.stack(waypoint_data, axis=0)  # [T, 192]
+        # Each waypoint now contains execution_data with shape (window_step, C)
+        # Concatenate all execution data to get the full motion sequence
+        waypoint_data_list = [wp['execution_data'] for wp in collected_waypoints]
+        out_motions = np.concatenate(waypoint_data_list, axis=0)  # [T, 192]
         out_motions = np.expand_dims(out_motions, axis=0)  # [1, T, 192]
     
     # Split gesture and expression
