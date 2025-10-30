@@ -953,21 +953,18 @@ class DiffSHEGRealtimeWrapper:
         out_motions = np.concatenate(out_motions, 1)  # [B, T, C]
         self.logger.info(f"[REFERENCE PIPELINE] Generated motion: shape={out_motions.shape}")
         
-        # Split into gesture and expression if needed
-        if opt.unidiffuser or opt.net_dim_pose == 192:
-            out_motions, out_expression = np.split(out_motions, [opt.split_pos], axis=-1)
-            self.logger.info(
-                f"[REFERENCE PIPELINE] Split: gesture={out_motions.shape}, expression={out_expression.shape}"
-            )
+        # NOTE: Keep gesture and expression COMBINED for waypoints
+        # The WaypointCollector will handle splitting when saving to files
+        # out_motions contains full gesture+expression if opt.net_dim_pose == 192
         
         # Convert to waypoints
-        # out_motions shape: [1, T, C] where T is number of frames
+        # out_motions shape: [1, T, C] where C is net_dim_pose (192 for gesture+expression)
         all_waypoints = []
         gesture_fps = self.gesture_fps
         
         for frame_idx in range(out_motions.shape[1]):
             timestamp = frame_idx / gesture_fps
-            gesture_data = out_motions[0, frame_idx, :]  # [C,]
+            gesture_data = out_motions[0, frame_idx, :]  # [C,] - full gesture+expression
             
             waypoint = GestureWaypoint(
                 waypoint_index=frame_idx,
