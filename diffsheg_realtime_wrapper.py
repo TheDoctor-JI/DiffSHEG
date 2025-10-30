@@ -909,8 +909,9 @@ class DiffSHEGRealtimeWrapper:
         if add_cond not in [None, {}]:
             add_cond_list = get_windows(add_cond, opt.n_poses, window_step)
         
-        # Prepare person ID
-        p_id = torch.zeros((1, 1))  # Default to person 0
+        # Prepare person ID (same as official runner: uses person ID 2, which is index 1)
+        p_id_ori = 2  # Person ID used in official test_custom_aud()
+        p_id = torch.ones((1, 1)) * (p_id_ori - 1)  # Convert to 0-indexed
         p_id = trainer.one_hot(p_id, opt.speaker_dim).detach().to(device)
         
         # Generate motion for each window
