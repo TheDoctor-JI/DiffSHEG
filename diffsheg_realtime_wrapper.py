@@ -1175,35 +1175,3 @@ class DiffSHEGRealtimeWrapper:
         return window
 
     
-
-# Example usage
-if __name__ == "__main__":
-    # This is a demonstration of how to use the wrapper
-    # In practice, you would initialize this with your trained DiffSHEG model
-    
-    # Example: Initialize wrapper (pseudo-code)
-    # wrapper = DiffSHEGRealtimeWrapper(
-    #     diffsheg_model=your_trained_model,
-    #     opt=your_opt_config,
-    #     start_margin=0.5,
-    #     audio_sr=16000,
-    #     device="cuda"
-    # )
-    # wrapper.start()
-    # 
-    # # Add audio chunks as they arrive from your audio system
-    # # Audio data can be: bytes, bytearray, list of integers (as from app.py), or numpy arrays
-    # # Playback starts automatically when chunk_index=0 arrives
-    # wrapper.add_audio_chunk(utterance_id=1, chunk_index=0, audio_data=chunk0, duration=0.1)  # Playback starts here
-    # wrapper.add_audio_chunk(utterance_id=1, chunk_index=1, audio_data=chunk1, duration=0.1)
-    # wrapper.add_audio_chunk(utterance_id=1, chunk_index=2, audio_data=chunk2, duration=0.1)
-    # # ... chunks stop arriving naturally when audio generation finishes
-    # # Cleanup happens automatically after playback ends (default 2 seconds after last audio)
-    # 
-    # # Cancel if interrupted (only explicit cancellation signal needed)
-    # # wrapper.cancel_utterance(utterance_id=1)
-    # 
-    # # Cleanup
-    # wrapper.stop()
-    
-    print("DiffSHEG Realtime Wrapper - See class documentation for usage")
