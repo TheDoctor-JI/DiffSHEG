@@ -506,9 +506,8 @@ class DiffSHEGRealtimeWrapper:
                 # Simply discard everything - generation is faster than realtime
                 # so we can regenerate from scratch for the next utterance
                 total_samples = self.current_utterance.get_total_samples()
-                total_waypoints = len(self.current_utterance.gesture_waypoints.waypoints) if self.current_utterance.gesture_waypoints else 0
                 self.current_utterance = None
-                self.logger.info(f"Utterance {utterance_id} cancelled (had {total_samples} samples, {total_waypoints} waypoints)")
+                self.logger.info(f"Utterance {utterance_id} cancelled (had {total_samples} samples)")
             else:
                 self.logger.info(f"Utterance {utterance_id} marked as cancelled (not current utterance)")
     
@@ -522,7 +521,6 @@ class DiffSHEGRealtimeWrapper:
             if self.current_utterance is not None:
                 utterance_id = self.current_utterance.utterance_id
                 total_samples = self.current_utterance.get_total_samples()
-                total_waypoints = len(self.current_utterance.gesture_waypoints.waypoints) if self.current_utterance.gesture_waypoints else 0
                 duration_sec = total_samples / self.current_utterance.sample_rate
                 
                 # Mark as cancelled to reject late chunks
@@ -530,7 +528,7 @@ class DiffSHEGRealtimeWrapper:
     
                 self.current_utterance = None
                 
-                self.logger.info(f"Utterance {utterance_id} auto-cleanup: playback ended naturally (duration={duration_sec:.2f}s, {total_waypoints} waypoints executed)")
+                self.logger.info(f"Utterance {utterance_id} auto-cleanup: playback ended naturally (duration={duration_sec:.2f}s")
 
 
     '''

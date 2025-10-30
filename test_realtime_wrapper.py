@@ -641,7 +641,7 @@ def main():
     print("Initializing realtime wrapper...")
     
     # Enable non-streaming sanity check mode
-    DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
+    DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = False
     
     print("="*60)
     print(f"{'ENABLING' if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK else 'DISABLING'} NON_STREAMING_SANITY_CHECK MODE")
@@ -658,6 +658,7 @@ def main():
             'timestamp': waypoint.timestamp,
             'gesture_data': waypoint.gesture_data.copy()  # Shape (C,) - single frame
         })
+        print(f'Received waypoint #{waypoint.waypoint_index} at elapsed time {waypoint.timestamp}')
 
     wrapper = DiffSHEGRealtimeWrapper(
         diffsheg_model=trainer,
