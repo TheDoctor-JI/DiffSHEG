@@ -318,7 +318,9 @@ class DiffSHEGRealtimeWrapper:
         
         self.logger.info(f"DiffSHEG parameters: window_size={self.window_size}, overlap={self.overlap_len}, step={self.window_step}, fps={self.gesture_fps}")
 
-        # Audio feature extraction parameters (match official DiffSHEG preprocessing)
+        # Audio feature extraction parameters (EXACTLY matching official test_custom_aud)
+        # Official code: mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
+        # NO explicit n_fft, win_length, window, center, or power_to_db conversion!
         self.mel_sample_rate = 18000
         self.mel_hop_length = 1200
         self.mel_num_mels = 128
@@ -328,31 +330,7 @@ class DiffSHEGRealtimeWrapper:
                 f"Mel frame rate {mel_frame_rate:.3f} does not match gesture FPS {self.gesture_fps}; check configuration."
             )
 
-        # Optional audio normalization stats (rarely enabled for BEAT)
-        self.audio_norm_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None
-        if getattr(self.opt, "audio_norm", False):
-            cache_root = os.path.join(
-                "data",
-                "BEAT",
-                "beat_cache",
-                getattr(self.opt, "beat_cache_name", ""),
-                "train",
-                getattr(self.opt, "audio_rep", "wave16k"),
-            )
-            mean_path = os.path.join(cache_root, "npy_mean.npy")
-            std_path = os.path.join(cache_root, "npy_std.npy")
-            if os.path.exists(mean_path) and os.path.exists(std_path):
-                self.audio_norm_stats = (
-                    np.load(mean_path).astype(np.float32),
-                    np.load(std_path).astype(np.float32),
-                )
-                self.logger.info(f"Loaded audio normalization stats from {cache_root}")
-            else:
-                self.logger.warning(
-                    f"Audio normalization enabled but stats not found under {cache_root}; continuing without normalization."
-                )
-                self.audio_norm_stats = None
-        
+
     def start(self):
         """Start the wrapper threads."""
         self.running = True
@@ -935,25 +913,19 @@ class DiffSHEGRealtimeWrapper:
             return None, None
 
         raw_audio = np.asarray(audio_float, dtype=np.float32)
-        audio_proc = raw_audio.copy()
 
-        if self.audio_norm_stats is not None:
-            mean_audio, std_audio = self.audio_norm_stats
-            if mean_audio.size == 0 or std_audio.size == 0:
-                self.logger.warning("Audio normalization stats empty; skipping normalization.")
-            else:
-                repeats = int(np.ceil(audio_proc.size / mean_audio.size))
-                mean_tiled = np.tile(mean_audio, repeats)[:audio_proc.size]
-                std_tiled = np.tile(std_audio, repeats)[:audio_proc.size]
-                std_tiled = np.clip(std_tiled, 1e-6, None)
-                audio_proc = (audio_proc - mean_tiled) / std_tiled
 
+        # Resample to 18kHz
         try:
-            audio_18k = librosa.resample(audio_proc, orig_sr=sample_rate, target_sr=self.mel_sample_rate)
+            audio_18k = librosa.resample(raw_audio, orig_sr=sample_rate, target_sr=self.mel_sample_rate)
         except Exception as exc:  # pragma: no cover - defensive guard
             self.logger.error(f"Failed to resample audio to {self.mel_sample_rate} Hz: {exc}")
             return None, None
 
+        # === FIX #2: Compute mel spectrogram with EXACT official trimming ===
+        # Official code (runner.py test_custom_aud, line ~1244-1249):
+        #   mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
+        #   mel = mel[..., :-1]  # UNCONDITIONALLY remove last frame
         mel_full = librosa.feature.melspectrogram(
             y=audio_18k,
             sr=self.mel_sample_rate,
@@ -961,12 +933,16 @@ class DiffSHEGRealtimeWrapper:
             n_mels=self.mel_num_mels,
         )
         mel_full = mel_full.astype(np.float32, copy=False)
-        if mel_full.shape[1] > 1:
-            mel_full = mel_full[:, :-1]
+        
+        # UNCONDITIONALLY remove last frame (matching official code exactly)
+        mel_full = mel_full[..., :-1]
+        
+        # Handle empty mel case (shouldn't happen with proper audio length)
         if mel_full.shape[1] == 0:
-            self.logger.debug("Mel spectrogram empty after trimming; inserting a zero frame.")
-            mel_full = np.zeros((self.mel_num_mels, 1), dtype=np.float32)
+            self.logger.warning("Mel spectrogram empty after trimming; returning None")
+            return None, None
 
+        # Transpose to [T, 128] (official: np.swapaxes(mel, -1, -2))
         mel_swapped = np.swapaxes(mel_full, -1, -2)
         mel_swapped = np.ascontiguousarray(mel_swapped, dtype=np.float32)
         audio_emb_full = torch.from_numpy(mel_swapped).unsqueeze(0).to(self.device)
@@ -1000,7 +976,12 @@ class DiffSHEGRealtimeWrapper:
         """
         Generate gestures for a window of audio using FULL audio context.
         
-        CRITICAL: Following official DiffSHEG pattern:
+        CRITICAL FIXES applied to match official DiffSHEG behavior:
+        1. NO audio normalization (official: opt.audio_norm = False)
+        2. UNCONDITIONAL mel trimming: mel[..., :-1]
+        3. Correct frame/sample index conversion (mel FPS == gesture FPS == 15)
+        
+        Official DiffSHEG pattern:
         1. Extract mel/HuBERT features from FULL audio (0 to window_end_sample)
         2. Window the features to get the current window
         3. Generate gestures for the windowed features
@@ -1033,7 +1014,7 @@ class DiffSHEGRealtimeWrapper:
         audio_int16 = np.frombuffer(audio_bytes_full, dtype=np.int16)
         if audio_int16.size == 0:
             return []
-        audio_float = audio_int16.astype(np.float32) / 32767.0
+        audio_float = audio_int16.astype(np.float32) / 32768.0
 
         # Extract full-context audio embeddings (mel + optional HuBERT)
         audio_emb_full, hubert_feat_full = self._compute_full_audio_features(audio_float, sample_rate)
@@ -1043,12 +1024,17 @@ class DiffSHEGRealtimeWrapper:
             )
             return []
 
+        # === FIX #1: Convert sample indices to frame indices ===
+        # Since mel frame rate (18000/1200 = 15 FPS) equals gesture FPS (15 FPS),
+        # we can use gesture frame indices directly to index mel features
         window_start_frame = int(round(window_start_sample / sample_rate * gesture_fps))
         full_audio_duration = audio_float.shape[0] / sample_rate
         self.logger.debug(
             f"Utterance {utterance_id} window start={window_start_frame}, audio={full_audio_duration:.3f}s, hubert={hubert_feat_full is not None}"
         )
 
+        # Window the mel features using frame indices
+        # This is correct because mel FPS == gesture FPS == 15
         mel_window_start = max(0, window_start_frame)
         mel_window_end = mel_window_start + self.window_size
 
