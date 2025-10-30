@@ -596,9 +596,6 @@ def main():
     opt = parser.parse()
     opt = setup_beat_config(opt)
     
-    # Match official runner behavior: fix the very first window to reduce initial jittering
-    opt.fix_very_first = False
-    
     # Set device
     opt.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     opt.gpu_id = 0
