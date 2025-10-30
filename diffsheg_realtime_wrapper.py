@@ -240,7 +240,7 @@ class DiffSHEGRealtimeWrapper:
     NON_STREAMING_SANITY_CHECK = False
     
     # Global flags for constrained feature extraction
-    USE_CONSTRAINED_FEATURES = False
+    USE_CONSTRAINED_FEATURES = True
     AUDIO_DUR_FOR_FEATURES = 5.0  # Duration in seconds for constrained audio context
     
     def __init__(
@@ -541,7 +541,7 @@ class DiffSHEGRealtimeWrapper:
     
                 self.current_utterance = None
                 
-                self.logger.info(f"Utterance {utterance_id} auto-cleanup: playback ended naturally (duration={duration_sec:.2f}s")
+                self.logger.info(f"Utterance {utterance_id} auto-cleanup: playback ended naturally (duration={duration_sec:.2f}s)")
 
 
     '''
