@@ -545,8 +545,8 @@ class DiffSHEGRealtimeWrapper:
             utterance.add_audio_samples(audio_data)
             audio_samples_after = utterance.get_total_samples()
             
-            # Avoid too frequent logging
-            self.logger.debug(f"Utterance {utterance_id} chunk {chunk_index}: added {audio_samples_after - audio_samples_before} samples (total: {audio_samples_after})")
+            # # Avoid too frequent logging
+            # self.logger.debug(f"Utterance {utterance_id} chunk {chunk_index}: added {audio_samples_after - audio_samples_before} samples (total: {audio_samples_after})")
     
     def cancel_utterance(self):
         """
