@@ -1102,6 +1102,7 @@ class DiffSHEGRealtimeWrapper:
             return None
         
         # ===== STEP 1-4: Extract or use precomputed features =====
+        self.logger.debug('Extracting audio features for the window.')
         if precomputed_mel is not None:
             # Non-streaming mode: Use precomputed features
             audio_emb = precomputed_mel  # [1, T, 128]
@@ -1176,11 +1177,15 @@ class DiffSHEGRealtimeWrapper:
                 inpaint_dict['gt'][:, :self.overlap_len, :] = prev_frames
         
         # ===== STEP 8: Generate using official trainer method =====
+        self.logger.debug('Starting generation for the window.')
         with torch.no_grad():
             outputs = self.model.generate_batch(
                 audio_window, p_id, C, add_cond, inpaint_dict
             )
         
+
+        self.logger.debug('Finalizing generated outputs for the window.')
+
         outputs_np = outputs.cpu().numpy()[0]  # [window_size, C] - FULL window output
         
         # ===== STEP 9: Create individual waypoints for each frame =====
