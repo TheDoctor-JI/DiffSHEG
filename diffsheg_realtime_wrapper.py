@@ -57,6 +57,7 @@ import torch.nn.functional as F
 import librosa
 import soundfile as sf
 from datetime import datetime
+import hashlib
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -259,6 +260,10 @@ class DiffSHEGRealtimeWrapper:
     
     # Global flag for saving audio windows for debugging
     SAVE_WINDOWS = False
+    
+    # Debug flag for tracing audio chunk arrival
+    DEBUG_AUDIO_TRACE = True
+    DEBUG_AUDIO_TRACE_SAMPLE_N = 16
     
     def __init__(
         self,
@@ -577,6 +582,19 @@ class DiffSHEGRealtimeWrapper:
             audio_data: Raw audio data (list of integers)
             duration: Optional duration of the chunk in seconds (not used internally, kept for API compatibility)
         """
+        # Optional tracing of incoming chunk before any conversion
+        if DiffSHEGRealtimeWrapper.DEBUG_AUDIO_TRACE:
+            try:
+                b = bytes(audio_data) if isinstance(audio_data, list) else bytes()
+                md5 = hashlib.md5(b).hexdigest() if b else None
+                head = audio_data[:self.DEBUG_AUDIO_TRACE_SAMPLE_N] if isinstance(audio_data, list) else None
+                self.logger.debug(
+                    f"[TRACE:Wrapper recv] add_audio_chunk: utt={utterance_id} chunk={chunk_index} "
+                    f"lenB={len(b)} md5={md5} kind={'list' if isinstance(audio_data, list) else type(audio_data).__name__} head={head}"
+                )
+            except Exception as e:
+                self.logger.debug(f"[TRACE:Wrapper recv] checksum error: {e}")
+
         # Reject chunks for cancelled/timed-out utterances
         if utterance_id in self.cancelled_utterances:
             # Silently ignore - this is expected for late-arriving chunks after cancellation
