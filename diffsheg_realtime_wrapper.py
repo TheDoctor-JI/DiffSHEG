@@ -29,6 +29,18 @@ Both modes use the EXACT same official generation pipeline from DiffSHEG:
 To enable sanity check mode, set the flag BEFORE creating the wrapper:
     DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
     wrapper = DiffSHEGRealtimeWrapper(...)
+
+DEBUGGING FEATURES:
+===================
+
+SAVE_WINDOWS flag:
+- When enabled, saves each audio window sent to gesture generation as a WAV file
+- Files are saved to: embodiment_manager/logger/logs/audio_windows_<timestamp>/
+- Filename format: utt<utterance_id>_win<window_index>_samples<start>-<end>.wav
+- Useful for comparing audio content when troubleshooting performance issues
+- To enable:
+    DiffSHEGRealtimeWrapper.SAVE_WINDOWS = True
+    wrapper = DiffSHEGRealtimeWrapper(...)
 """
 
 import threading
@@ -43,6 +55,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import librosa
+import soundfile as sf
+from datetime import datetime
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -243,6 +257,9 @@ class DiffSHEGRealtimeWrapper:
     USE_CONSTRAINED_FEATURES = True
     AUDIO_DUR_FOR_FEATURES = 10.0  # Duration in seconds for constrained audio context
     
+    # Global flag for saving audio windows for debugging
+    SAVE_WINDOWS = False
+    
     def __init__(
         self,
         diffsheg_model,
@@ -309,6 +326,21 @@ class DiffSHEGRealtimeWrapper:
         )
         self.logger.info("DiffSHEG Realtime Wrapper initialized")
         self.logger.info(f"Configuration: sample_rate={self.audio_sr}, device={self.device}")
+        
+        # Setup audio window save directory if SAVE_WINDOWS is enabled
+        self.audio_windows_dir = None
+        if self.SAVE_WINDOWS:
+            # Create directory beside the log files
+            log_root = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'logger',
+                'logs'
+            )
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.audio_windows_dir = os.path.join(log_root, f'audio_windows_{timestamp}')
+            os.makedirs(self.audio_windows_dir, exist_ok=True)
+            self.logger.info(f"SAVE_WINDOWS enabled: saving audio windows to {self.audio_windows_dir}")
+            self.window_save_counter = 0  # Counter for saved windows
         
         # Check if HuBERT features are needed
         self.use_hubert = getattr(opt, 'addHubert', False) or getattr(opt, 'expAddHubert', False)
@@ -419,6 +451,50 @@ class DiffSHEGRealtimeWrapper:
                 
         except Exception as e:
             self.logger.warning(f"CUDA warm-up failed (non-critical): {e}")
+
+    def _save_audio_window(
+        self,
+        audio_bytes: bytes,
+        sample_rate: int,
+        utterance_id: int,
+        window_index: int,
+        window_start_sample: int,
+        window_end_sample: int
+    ):
+        """
+        Save an audio window to a WAV file for debugging.
+        
+        Args:
+            audio_bytes: Raw audio bytes (s16le encoded)
+            sample_rate: Audio sample rate (e.g., 16000)
+            utterance_id: ID of the utterance
+            window_index: Index of the window
+            window_start_sample: Starting sample index of the window
+            window_end_sample: Ending sample index of the window
+        """
+        if not self.SAVE_WINDOWS or self.audio_windows_dir is None:
+            return
+        
+        try:
+            # Convert bytes to numpy array
+            audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+            
+            # Convert to float32 in range [-1, 1] for soundfile
+            audio_float = audio_array.astype(np.float32) / 32768.0
+            
+            # Create filename with detailed information
+            filename = f"utt{utterance_id:03d}_win{window_index:04d}_samples{window_start_sample}-{window_end_sample}.wav"
+            filepath = os.path.join(self.audio_windows_dir, filename)
+            
+            # Save as WAV file
+            sf.write(filepath, audio_float, sample_rate)
+            
+            self.window_save_counter += 1
+            if self.window_save_counter % 10 == 0:
+                self.logger.debug(f"Saved {self.window_save_counter} audio windows to {self.audio_windows_dir}")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to save audio window: {e}")
 
     def start(self):
         """Start the wrapper threads."""
@@ -1100,6 +1176,17 @@ class DiffSHEGRealtimeWrapper:
         """
         if len(audio_bytes_truncated) == 0 and precomputed_mel is None:
             return None
+        
+        # ===== SAVE AUDIO WINDOW FOR DEBUGGING (if enabled) =====
+        window_idx = int(round(window_start_sample / sample_rate * gesture_fps)) // self.window_step
+        self._save_audio_window(
+            audio_bytes=audio_bytes_truncated,
+            sample_rate=sample_rate,
+            utterance_id=utterance_id,
+            window_index=window_idx,
+            window_start_sample=window_start_sample,
+            window_end_sample=window_end_sample
+        )
         
         # ===== STEP 1-4: Extract or use precomputed features =====
         self.logger.debug('Extracting audio features for the window.')
