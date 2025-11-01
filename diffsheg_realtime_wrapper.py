@@ -485,7 +485,11 @@ class DiffSHEGRealtimeWrapper:
         window_end_sample: int
     ):
         """
-        Save an audio window to a WAV file for debugging.
+        Save an audio window to a WAV file and text document for debugging.
+        
+        Saves two files:
+        1. WAV file: playable audio for listening
+        2. TXT file: raw audio samples as list of integers (byte values 0-255)
         
         Args:
             audio_bytes: Raw audio bytes (s16le encoded)
@@ -499,22 +503,46 @@ class DiffSHEGRealtimeWrapper:
             return
         
         try:
-            # Convert bytes to numpy array
+            # Create base filename with detailed information
+            base_filename = f"utt{utterance_id:03d}_win{window_index:04d}_samples{window_start_sample}-{window_end_sample}"
+            
+            # ===== Save WAV file =====
+            # Convert bytes to numpy array (s16le format)
             audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
             
             # Convert to float32 in range [-1, 1] for soundfile
             audio_float = audio_array.astype(np.float32) / 32768.0
             
-            # Create filename with detailed information
-            filename = f"utt{utterance_id:03d}_win{window_index:04d}_samples{window_start_sample}-{window_end_sample}.wav"
-            filepath = os.path.join(self.audio_windows_dir, filename)
+            wav_filepath = os.path.join(self.audio_windows_dir, base_filename + ".wav")
+            sf.write(wav_filepath, audio_float, sample_rate)
             
-            # Save as WAV file
-            sf.write(filepath, audio_float, sample_rate)
+            # ===== Save TXT file with audio samples as list of integers =====
+            # Convert bytes to list of integers (byte values 0-255)
+            # This matches the format used in the rest of the code
+            audio_as_int_list = list(audio_bytes)
+            
+            txt_filepath = os.path.join(self.audio_windows_dir, base_filename + ".txt")
+            with open(txt_filepath, 'w') as f:
+                f.write(f"# Audio Window: Utterance {utterance_id}, Window {window_index}\n")
+                f.write(f"# Sample range: {window_start_sample} - {window_end_sample}\n")
+                f.write(f"# Sample rate: {sample_rate} Hz\n")
+                f.write(f"# Encoding: s16le (2 bytes per sample)\n")
+                f.write(f"# Total bytes: {len(audio_bytes)}\n")
+                f.write(f"# Total samples: {len(audio_array)}\n")
+                f.write(f"# Duration: {len(audio_array)/sample_rate:.4f} seconds\n")
+                f.write(f"#\n")
+                f.write(f"# Audio bytes as list of integers (0-255):\n")
+                f.write(f"audio_data = {audio_as_int_list}\n")
+                f.write(f"\n")
+                f.write(f"# Statistics:\n")
+                f.write(f"# Min byte value: {min(audio_as_int_list) if audio_as_int_list else 'N/A'}\n")
+                f.write(f"# Max byte value: {max(audio_as_int_list) if audio_as_int_list else 'N/A'}\n")
+                f.write(f"# First 20 bytes: {audio_as_int_list[:20]}\n")
+                f.write(f"# Last 20 bytes: {audio_as_int_list[-20:]}\n")
             
             self.window_save_counter += 1
             if self.window_save_counter % 10 == 0:
-                self.logger.debug(f"Saved {self.window_save_counter} audio windows to {self.audio_windows_dir}")
+                self.logger.debug(f"Saved {self.window_save_counter} audio windows (WAV + TXT) to {self.audio_windows_dir}")
                 
         except Exception as e:
             self.logger.error(f"Failed to save audio window: {e}")
