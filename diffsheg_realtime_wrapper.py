@@ -766,20 +766,21 @@ class DiffSHEGRealtimeWrapper:
         # Extract HuBERT features if enabled
         hubert_feat = None
         if self.opt.expAddHubert or self.opt.addHubert:
+            # Keep features on GPU to avoid unnecessary CPU-GPU transfers
             hubert_feat = get_hubert_from_16k_speech_long(
                 self.hubert_model,
                 self.wav2vec2_processor,
                 torch.from_numpy(aud_ori).unsqueeze(0).to(self.device),
-                device=self.device
+                device=self.device,
+                return_on_cpu=False  # Keep on GPU for performance
             )
-            # Interpolate to match mel length
+            # Interpolate to match mel length (already on GPU)
             hubert_feat = F.interpolate(
                 hubert_feat.swapaxes(-1,-2).unsqueeze(0),
                 size=audio_emb.shape[1],
                 mode='linear',
                 align_corners=True
             ).swapaxes(-1,-2)  # [1, T, 1024]
-            hubert_feat = hubert_feat.to(self.device)
         
         return audio_emb, hubert_feat
     

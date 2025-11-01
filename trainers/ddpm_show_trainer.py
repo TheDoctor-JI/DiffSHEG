@@ -1141,7 +1141,21 @@ class DDPMTrainer_show(object):
 
 
 @torch.no_grad()
-def get_hubert_from_16k_speech_long(hubert_model, wav2vec2_processor, speech, device="cuda:0"):
+def get_hubert_from_16k_speech_long(hubert_model, wav2vec2_processor, speech, device="cuda:0", return_on_cpu=True):
+    """
+    Extract HuBERT features from 16kHz speech.
+    
+    Args:
+        hubert_model: HuBERT model
+        wav2vec2_processor: Wav2Vec2 processor
+        speech: Input speech tensor
+        device: Device to run on (default: "cuda:0")
+        return_on_cpu: If True, return features on CPU (default behavior for compatibility).
+                      If False, keep features on GPU to avoid unnecessary transfers.
+    
+    Returns:
+        HuBERT features tensor [1, T, 1024]
+    """
     hubert_model = hubert_model.to(device)
     # if speech.ndim ==2:
     #     speech = speech[:, 0] # [T, 2] ==> [T,]
@@ -1179,13 +1193,18 @@ def get_hubert_from_16k_speech_long(hubert_model, wav2vec2_processor, speech, de
         hidden_states = hubert_model(input_values).last_hidden_state # [B=1, T=pts//320, hid=1024]
         res_lst.append(hidden_states[0])
     
-    ret = torch.cat(res_lst, dim=0).cpu() # [T, 1024]
+    ret = torch.cat(res_lst, dim=0) # [T, 1024]
     # assert ret.shape[0] == expected_T
     assert abs(ret.shape[0] - expected_T) <= 1
     if ret.shape[0] < expected_T:
         ret = torch.nn.functional.pad(ret, (0,0,0,expected_T-ret.shape[0]))
     else:
         ret = ret[:expected_T]
+    
+    # Move to CPU if requested (default behavior for backward compatibility)
+    if return_on_cpu:
+        ret = ret.cpu()
+    
     return ret
 
 class Summary(Enum):
