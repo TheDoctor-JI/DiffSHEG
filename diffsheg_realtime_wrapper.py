@@ -68,6 +68,11 @@ try:
 except ImportError:
     get_hubert_from_16k_speech_long = None
 
+
+DEBUG_AUDIO_TRACE = True
+
+
+
 @dataclass
 class GestureWaypoint:
     """
@@ -144,11 +149,25 @@ class Utterance:
             audio_data: Audio data as list of integers
         """
         if isinstance(audio_data, list):
+
+            if DEBUG_AUDIO_TRACE:
+                # --- START DEBUGGING CHANGE ---
+                # Check for out-of-range values before converting to bytes
+                invalid_values = [v for v in audio_data if not (0 <= v <= 255)]
+                if invalid_values:
+                    # This is a temporary logger for debugging, assuming a logger is available on the class
+                    # In a real scenario, you'd use self.logger if it exists.
+                    print(f"[ERROR] Utterance {self.utterance_id}: Found {len(invalid_values)} integers in audio_data list outside the valid byte range (0-255).")
+                    print(f"         Example invalid values: {invalid_values[:10]}")
+                # --- END DEBUGGING CHANGE ---
+
+
             # Convert list of integers to bytes (as in process_system_reference_audio)
             audio_bytes = bytes(audio_data)
         else:
             raise TypeError(f"Unsupported audio_data type: {type(audio_data)}")
         
+
         self.audio_samples.extend(audio_bytes)
     
     def get_total_samples(self) -> int:
@@ -262,7 +281,6 @@ class DiffSHEGRealtimeWrapper:
     SAVE_WINDOWS = False
     
     # Debug flag for tracing audio chunk arrival
-    DEBUG_AUDIO_TRACE = True
     DEBUG_AUDIO_TRACE_SAMPLE_N = 16
     
     def __init__(
@@ -583,7 +601,7 @@ class DiffSHEGRealtimeWrapper:
             duration: Optional duration of the chunk in seconds (not used internally, kept for API compatibility)
         """
         # Optional tracing of incoming chunk before any conversion
-        if DiffSHEGRealtimeWrapper.DEBUG_AUDIO_TRACE:
+        if DEBUG_AUDIO_TRACE:
             try:
                 b = bytes(audio_data) if isinstance(audio_data, list) else bytes()
                 md5 = hashlib.md5(b).hexdigest() if b else None
