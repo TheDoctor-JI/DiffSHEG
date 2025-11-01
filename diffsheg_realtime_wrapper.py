@@ -654,7 +654,11 @@ class DiffSHEGRealtimeWrapper:
                 return
             
             # If this is a new utterance, discard the old one
-            if self.current_utterance is None or self.current_utterance.utterance_id != utterance_id:
+            if self.current_utterance is None:
+                
+                ## For debug
+                # or self.current_utterance.utterance_id != utterance_id:
+                
                 # Mark old utterance as cancelled if it exists
                 if self.current_utterance is not None:
                     old_utterance_id = self.current_utterance.utterance_id
