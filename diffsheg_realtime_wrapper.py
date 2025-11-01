@@ -392,14 +392,13 @@ class DiffSHEGRealtimeWrapper:
                 # One-hot encode speaker ID
                 dummy_pid_onehot = self.model.one_hot(dummy_pid, self.opt.speaker_dim)
                 
-                # Create dummy HuBERT features if enabled
+                # Create add_cond dict with HuBERT features if enabled
+                dummy_add_cond = {}
                 if self.use_hubert:
-                    dummy_hubert = torch.randn(1, self.window_size, 1024, device=self.device)
-                    dummy_audio = torch.cat([dummy_audio, dummy_hubert], dim=-1)
+                    dummy_add_cond['hubert'] = torch.randn(1, self.window_size, 1024, device=self.device)
                 
                 # Create empty inpainting dict
                 dummy_inpaint_dict = {}
-                dummy_add_cond = {}
                 
                 # Run inference
                 self.logger.debug("Running warm-up inference...")
