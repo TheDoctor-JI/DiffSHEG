@@ -356,6 +356,11 @@ class DiffSHEGRealtimeWrapper:
         
         self.logger.info(f"DiffSHEG parameters: window_size={self.window_size}, overlap={self.overlap_len}, step={self.window_step}, fps={self.gesture_fps}")
 
+        # Warm up CUDA context with dummy inference
+        self.logger.info("Warming up CUDA context...")
+        self._warmup_cuda_context()
+        self.logger.info("CUDA context warmed up successfully")
+
         # Audio feature extraction parameters (EXACTLY matching official test_custom_aud)
         # Official code: mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
         # NO explicit n_fft, win_length, window, center, or power_to_db conversion!
@@ -368,6 +373,52 @@ class DiffSHEGRealtimeWrapper:
                 f"Mel frame rate {mel_frame_rate:.3f} does not match gesture FPS {self.gesture_fps}; check configuration."
             )
 
+    def _warmup_cuda_context(self):
+        """
+        Warm up CUDA context with dummy inference to eliminate cold-start overhead.
+        
+        This runs a full forward pass through the model to:
+        1. Initialize CUDA kernels
+        2. Allocate GPU memory pools
+        3. Compile any JIT operations
+        4. Eliminate first-run latency
+        """
+        try:
+            with torch.no_grad():
+                # Create dummy inputs matching expected shapes
+                dummy_audio = torch.randn(1, self.window_size, 128, device=self.device)
+                dummy_pid = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                
+                # One-hot encode speaker ID
+                dummy_pid_onehot = self.model.one_hot(dummy_pid, self.opt.speaker_dim)
+                
+                # Create dummy HuBERT features if enabled
+                if self.use_hubert:
+                    dummy_hubert = torch.randn(1, self.window_size, 1024, device=self.device)
+                    dummy_audio = torch.cat([dummy_audio, dummy_hubert], dim=-1)
+                
+                # Create empty inpainting dict
+                dummy_inpaint_dict = {}
+                dummy_add_cond = {}
+                
+                # Run inference
+                self.logger.debug("Running warm-up inference...")
+                _ = self.model.generate_batch(
+                    dummy_audio, 
+                    dummy_pid_onehot, 
+                    self.opt.net_dim_pose,
+                    dummy_add_cond,
+                    dummy_inpaint_dict
+                )
+                
+                # Synchronize to ensure all operations complete
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+                
+                self.logger.debug("Warm-up inference completed")
+                
+        except Exception as e:
+            self.logger.warning(f"CUDA warm-up failed (non-critical): {e}")
 
     def start(self):
         """Start the wrapper threads."""
