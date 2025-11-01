@@ -393,9 +393,10 @@ class DiffSHEGRealtimeWrapper:
                 dummy_pid_onehot = self.model.one_hot(dummy_pid, self.opt.speaker_dim)
                 
                 # Create add_cond dict with HuBERT features if enabled
+                # NOTE: The key must be 'pretrain_aud_feat' to match the actual generation pipeline
                 dummy_add_cond = {}
                 if self.use_hubert:
-                    dummy_add_cond['hubert'] = torch.randn(1, self.window_size, 1024, device=self.device)
+                    dummy_add_cond['pretrain_aud_feat'] = torch.randn(1, self.window_size, 1024, device=self.device)
                 
                 # Create empty inpainting dict
                 dummy_inpaint_dict = {}
