@@ -219,9 +219,6 @@ class Utterance:
         else:
             raise TypeError(f"Unsupported audio_data type: {type(audio_data)}")
     
-        if DO_AUD_NORMALIZATION:
-            audio_bytes = normalize_audio_via_wav_io(audio_bytes, sample_rate=16000)
-
         self.audio_samples += audio_bytes
     
     def get_total_samples(self) -> int:
@@ -1186,6 +1183,9 @@ class DiffSHEGRealtimeWrapper:
         """
         if len(audio_bytes_truncated) == 0 and precomputed_mel is None:
             return None
+
+        if DO_AUD_NORMALIZATION:
+            audio_bytes_truncated = normalize_audio_direct(audio_bytes_truncated)
 
         # ===== SAVE AUDIO WINDOW FOR DEBUGGING (if enabled) =====
         window_idx = int(round(window_start_sample / sample_rate * gesture_fps)) // self.window_step
