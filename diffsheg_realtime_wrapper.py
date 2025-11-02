@@ -68,6 +68,7 @@ import librosa
 import soundfile as sf
 from datetime import datetime
 import hashlib
+import gc
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -81,7 +82,9 @@ except ImportError:
     get_hubert_from_16k_speech_long = None
 
 
-ENABLE_CLEARNING = True
+ENABLE_CLEARING_CONTENT= True
+ENABLE_CLEARING_META1 = True
+ENAGLE_CLEARING_META2 = False
 
 @dataclass
 class GestureWaypoint:
@@ -117,6 +120,8 @@ class WaypointWindow:
 class Utterance:
     """Tracks an ongoing or completed utterance with audio stored as concatenated samples."""
     
+    PLACE_HOLDER_ID = -1
+
     def __init__(
         self, 
         utterance_id: int,
@@ -218,28 +223,45 @@ class Utterance:
         This resets all data structures while keeping the object alive.
         """
         
-        if ENABLE_CLEARNING:
-            with self.waypoints_lock:
-
-                self.utterance_id = -1  # Reset to placeholder ID
-
-                # Clear audio data
-                self.audio_samples = b''
+        with self.waypoints_lock:
             
+            if ENABLE_CLEARING_META1:
+                self.utterance_id = Utterance.PLACE_HOLDER_ID  # Reset to placeholder ID
+
+                # Reset window indices to start from sample 0
+                window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
+
+
+                self.next_window_start_sample = 0
+                self.next_window_end_sample = window_duration_samples
+
+                
+            if ENAGLE_CLEARING_META2:
+
                 # Clear timing information
                 self.start_time = None
                 self.last_chunk_received_time = None
-                
-                # Reset window indices to start from sample 0
-                window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
-                self.next_window_start_sample = 0
-                self.next_window_end_sample = window_duration_samples
+
+            if ENABLE_CLEARING_CONTENT:
+                # Clear audio data
+                self.audio_samples = b''
                 
                 # Clear gesture data structures
+                for window in self.windows:
+                    for wp in window.execution_waypoints:
+                        del wp.gesture_data
+                    for wp in window.context_waypoints:
+                        del wp.gesture_data
+                
+                for wp in self.execution_waypoints:
+                    del wp.gesture_data
                 self.windows = []  # Create new list instead of .clear()
                 self.execution_waypoints = []  # Create new list
                 self.last_executed_waypoint_index = -1
-    
+
+                # CRITICAL: Force immediate GPU cleanup
+                gc.collect()
+
     def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
         Find the waypoint that should be executed in the next interval.
@@ -422,7 +444,7 @@ class DiffSHEGRealtimeWrapper:
         
         # Current utterance tracking (created once and reused)
         self.current_utterance: Utterance = Utterance(
-            utterance_id=-1,  # Placeholder ID, will be updated when first chunk arrives
+            utterance_id=Utterance.PLACE_HOLDER_ID,  # Placeholder ID, will be updated when first chunk arrives
             sample_rate=self.audio_sr,
             gesture_fps=self.gesture_fps,
             window_size=self.window_size,
@@ -786,7 +808,7 @@ class DiffSHEGRealtimeWrapper:
             # # Avoid too frequent logging
             # self.logger.debug(f"Utterance {utterance_id} chunk {chunk_index}: added {audio_samples_after - audio_samples_before} samples (total: {audio_samples_after})")
     
-    def stop_current_utterance(self, will_lock = True):
+    def stop_current_utterance(self, will_lock: bool):
         """
         Clear the current utterance content and prepare it for reuse.
         
@@ -804,7 +826,7 @@ class DiffSHEGRealtimeWrapper:
         try:
             if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR:
                 # Add to stopped set to reject any late-arriving chunks
-                if self.current_utterance.utterance_id != -1:
+                if self.current_utterance.utterance_id != Utterance.PLACE_HOLDER_ID:
                     self.stopped_utterances.add(self.current_utterance.utterance_id)
                     
                     # Clear the utterance content but keep the object alive
@@ -856,8 +878,8 @@ class DiffSHEGRealtimeWrapper:
             
             with self.utterance_lock:
                 
-                # Skip if no valid utterance (placeholder ID -1)
-                if self.current_utterance.utterance_id == -1:
+                # Skip if no valid utterance (placeholder ID)
+                if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID:
                     continue
                 
                 # Skip if playback hasn't started yet (no chunk 0 received)
@@ -891,7 +913,7 @@ class DiffSHEGRealtimeWrapper:
                         self.waypoint_callback(waypoint)
             
             if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR and should_cleanup:
-                self.stop_current_utterance()
+                self.stop_current_utterance(will_lock=True)
             
             # Sleep for the remaining time to maintain 10ms interval
             elapsed = time.time() - iteration_start_time
@@ -924,7 +946,7 @@ class DiffSHEGRealtimeWrapper:
             
             # Wait for audio to start arriving
             with self.utterance_lock:
-                if self.current_utterance.utterance_id == -1 or self.current_utterance.start_time is None:
+                if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID or self.current_utterance.start_time is None:
                     continue
             
             # Monitor for audio completion
@@ -933,7 +955,7 @@ class DiffSHEGRealtimeWrapper:
                 
                 with self.utterance_lock:
 
-                    if self.current_utterance.utterance_id == -1:
+                    if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID:
                         break
                     
                     # Check if we've stopped receiving chunks
@@ -1028,7 +1050,7 @@ class DiffSHEGRealtimeWrapper:
         """
         with self.utterance_lock:
 
-            if self.current_utterance.utterance_id == -1:
+            if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID:
                 return
             
             utterance_id = self.current_utterance.utterance_id
@@ -1233,8 +1255,8 @@ class DiffSHEGRealtimeWrapper:
             
             with self.utterance_lock:
                 
-                # Skip if no valid utterance (placeholder ID -1)
-                if self.current_utterance.utterance_id == -1:
+                # Skip if no valid utterance (placeholder ID)
+                if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID:
                     continue
                 
                 # Check if we have enough samples for the next window
