@@ -18,12 +18,14 @@ TESTING MODES:
 DEBUGGING FLAGS:
 ===============
 
-EMULATE_2_UTTR (set in main()):
-   - When True: Splits test audio into 2 parts with different utterance IDs
-   - Triggers utterance clearing/reuse behavior in the wrapper
-   - Helps reproduce performance issues related to ENAGLE_CLEARING_META2
-   - Provides performance diagnostics comparing Utterance 1 vs Utterance 2
-   - Use this to verify if clear() operation causes slowdown
+EMULATE_MULTI_UTTR (set in main()):
+   - When True: Splits test audio into multiple utterances with rapid cancellations
+   - Simulates the EXACT pattern from real log: Utterance 0→1→2→3 (hang on 3)
+   - Each utterance is ~1 second (except last) to match real usage pattern
+   - Triggers multiple rapid clear() operations before the problematic one
+   - Provides performance diagnostics for each utterance
+   - Based on log analysis: bug occurs after MULTIPLE rapid switches, not just 2
+   - Use this to reproduce the 100x slowdown that occurs on utterance 3 or later
 
 Both modes use the EXACT same official DiffSHEG generation pipeline:
 - Official mel spectrogram extraction (librosa.feature.melspectrogram)
@@ -598,15 +600,23 @@ def main():
     global waypoint_collector
     
     # ========================================================================
-    # TEST FLAG: Emulate 2 utterances to reproduce performance issue
+    # TEST FLAG: Emulate multiple utterances to reproduce performance issue
     # ========================================================================
-    # When True, splits test audio into 2 parts with different utterance IDs
-    # This triggers utterance clearing/reuse behavior in the wrapper
-    # to help reproduce the ENAGLE_CLEARING_META2 slowdown bug
-    EMULATE_2_UTTR = True
+    # Based on log analysis, the bug occurs after MULTIPLE rapid utterance switches
+    # The real scenario had: Utterance 0 → 1 → 2 → 3 (hangs on utterance 3)
+    # Each utterance was very short (~1 second) before being cancelled
     
-    # Where to split the audio (as fraction of total duration, 0.0 to 1.0)
-    SPLIT_FRACTION = 0.005  # Split at 50% of audio duration
+    EMULATE_MULTI_UTTR = True
+    
+    # Simulate rapid utterance cancellations (like in real usage)
+    # Format: list of (utterance_duration_fraction, utterance_id)
+    # The real log showed: 1s, 1.32s, 1s, then 2.52s (where it hung)
+    UTTERANCE_SPLITS = [
+        (0.13, 0),  # First ~1 second → utterance 0
+        (0.30, 1),  # Next ~1.3 seconds → utterance 1  
+        (0.43, 2),  # Next ~1 second → utterance 2
+        (1.00, 3),  # Remaining audio → utterance 3 (this is where hang occurs)
+    ]
     # ========================================================================
     
     # Parse arguments (mimicking the bash script)
@@ -716,37 +726,62 @@ def main():
     print(f"\nStreaming chunks at {playback_speed}x speed (chunk every {chunk_interval:.3f}s)...")
     print(f"Estimated streaming time: {len(chunks) * chunk_interval:.2f}s")
     
-    # Determine split point for 2-utterance emulation
-    if EMULATE_2_UTTR:
-        split_chunk_idx = int(len(chunks) * SPLIT_FRACTION)
+    # Determine split points for multi-utterance emulation
+    if EMULATE_MULTI_UTTR:
+        # Calculate chunk indices for each utterance boundary
+        utterance_boundaries = []
+        for frac, uttr_id in UTTERANCE_SPLITS:
+            chunk_idx = int(len(chunks) * frac)
+            utterance_boundaries.append((chunk_idx, uttr_id))
+        
         print(f"\n{'='*70}")
-        print(f"EMULATE_2_UTTR MODE ENABLED")
+        print(f"EMULATE_MULTI_UTTR MODE ENABLED")
         print(f"{'='*70}")
-        print(f"Splitting audio into 2 utterances:")
-        print(f"  - Utterance 1: chunks 0-{split_chunk_idx-1} ({split_chunk_idx} chunks)")
-        print(f"  - Utterance 2: chunks {split_chunk_idx}-{len(chunks)-1} ({len(chunks)-split_chunk_idx} chunks)")
-        print(f"This will trigger utterance clearing/reuse to reproduce the bug.")
+        print(f"Simulating rapid utterance cancellations (like real usage):")
+        prev_idx = 0
+        for chunk_idx, uttr_id in utterance_boundaries:
+            duration = (chunk_idx - prev_idx) * chunk_duration
+            print(f"  - Utterance {uttr_id}: chunks {prev_idx}-{chunk_idx-1} ({chunk_idx-prev_idx} chunks, {duration:.2f}s)")
+            prev_idx = chunk_idx
+        print(f"Based on real log: Utterances 0→1→2 cancelled quickly, then hang on 3")
+        print(f"This triggers multiple rapid clear() operations before the problematic one.")
         print(f"{'='*70}\n")
     else:
-        split_chunk_idx = len(chunks)  # No split, all chunks are utterance 1
-        print(f"\nEMULATE_2_UTTR MODE DISABLED - using single utterance")
+        utterance_boundaries = [(len(chunks), 0)]  # Single utterance
+        print(f"\nEMULATE_MULTI_UTTR MODE DISABLED - using single utterance")
     
     start_time = time.time()
     chunk_send_times = []  # Track time taken to send each chunk (for diagnostics)
     
+    # Track which utterance we're currently on
+    current_utterance_id = utterance_boundaries[0][1]
+    current_utterance_start_chunk = 0
+    boundary_idx = 0
+    
     for i, chunk in enumerate(chunks):
-        # Determine utterance ID based on EMULATE_2_UTTR flag
-        if EMULATE_2_UTTR and i >= split_chunk_idx:
-            utterance_id = 2
-            # Reset chunk index for new utterance
-            chunk_index = i - split_chunk_idx
-            
-            if i == split_chunk_idx:##Throw a cancellation command
-                print('-'*80)
+        # Determine utterance ID based on EMULATE_MULTI_UTTR flag
+        if EMULATE_MULTI_UTTR:
+            # Check if we've crossed into a new utterance boundary
+            if boundary_idx < len(utterance_boundaries) - 1 and i >= utterance_boundaries[boundary_idx + 1][0]:
+                # Cancel previous utterance (simulating real cancellation behavior)
+                print(f"\n{'='*70}")
+                print(f"CANCELLING UTTERANCE {current_utterance_id} at chunk {i}")
+                print(f"Switching to next utterance (rapid cancellation like real log)")
                 wrapper.stop_current_utterance(will_lock=True)
                 
+                boundary_idx += 1
+                current_utterance_id = utterance_boundaries[boundary_idx][1]
+                current_utterance_start_chunk = utterance_boundaries[boundary_idx][0]
+                
+                print(f"SWITCHED TO UTTERANCE {current_utterance_id}")
+                print(f"This is utterance switch #{boundary_idx}")
+                print(f"{'='*70}\n")
+                time.sleep(0.05)  # Small gap between utterances (50ms, like real usage)
+            
+            utterance_id = current_utterance_id
+            chunk_index = i - current_utterance_start_chunk
         else:
-            utterance_id = 1
+            utterance_id = utterance_boundaries[0][1]
             chunk_index = i
         
         chunk_start = time.time()
@@ -770,6 +805,47 @@ def main():
     elapsed = time.time() - start_time
     print(f"\nAll chunks sent in {elapsed:.2f}s")
     
+    # Performance diagnostics for multi-utterance test
+    if EMULATE_MULTI_UTTR and len(utterance_boundaries) > 1:
+        print(f"\n{'='*70}")
+        print(f"PERFORMANCE DIAGNOSTIC (EMULATE_MULTI_UTTR)")
+        print(f"{'='*70}")
+        
+        # Analyze performance for each utterance
+        for idx in range(len(utterance_boundaries)):
+            start_chunk = utterance_boundaries[idx][0] if idx > 0 else 0
+            end_chunk = utterance_boundaries[idx][0] if idx < len(utterance_boundaries) else len(chunks)
+            uttr_id = utterance_boundaries[idx][1]
+            
+            uttr_times = chunk_send_times[start_chunk:end_chunk]
+            if len(uttr_times) > 0:
+                print(f"\nUtterance {uttr_id} chunk processing (chunks {start_chunk}-{end_chunk-1}):")
+                print(f"  - Mean: {np.mean(uttr_times)*1000:.2f}ms")
+                print(f"  - Std:  {np.std(uttr_times)*1000:.2f}ms")
+                print(f"  - Max:  {np.max(uttr_times)*1000:.2f}ms")
+                print(f"  - Total chunks: {len(uttr_times)}")
+        
+        # Compare last utterance (where hang typically occurs) with first
+        first_uttr_times = chunk_send_times[0:utterance_boundaries[0][0]] if len(utterance_boundaries) > 0 else chunk_send_times
+        last_uttr_start = utterance_boundaries[-2][0] if len(utterance_boundaries) > 1 else 0
+        last_uttr_times = chunk_send_times[last_uttr_start:]
+        
+        if len(first_uttr_times) > 0 and len(last_uttr_times) > 0:
+            slowdown = np.mean(last_uttr_times) / np.mean(first_uttr_times)
+            print(f"\n{'='*70}")
+            print(f"Slowdown factor (Last vs First utterance): {slowdown:.2f}x")
+            
+            if slowdown > 10.0:
+                print(f"⚠️  SEVERE SLOWDOWN DETECTED after multiple clear() operations!")
+                print(f"    This matches the 100x bug reported in the log!")
+            elif slowdown > 5.0:
+                print(f"⚠️  SIGNIFICANT SLOWDOWN DETECTED after multiple clear().")
+            elif slowdown > 2.0:
+                print(f"⚠️  Moderate slowdown detected after multiple clear().")
+            else:
+                print(f"✓ No significant slowdown.")
+        print(f"{'='*70}\n")
+    
     # Wait for processing to complete
     if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK:
         print("\n[SANITY CHECK MODE] Waiting for audio completion and generation...")
@@ -779,10 +855,11 @@ def main():
     else:
         print("\nWaiting for gesture generation and playback to complete...")
         # Wait for audio duration + cleanup timeout
-        if EMULATE_2_UTTR:
-            # Need to wait for both utterances
-            wait_time = audio_duration + wrapper.cleanup_timeout * 2 + 1.0
-            print(f"Waiting {wait_time:.1f}s (extended for 2 utterances)...")
+        if EMULATE_MULTI_UTTR:
+            # Need to wait for multiple utterances
+            num_utterances = len(utterance_boundaries)
+            wait_time = audio_duration + wrapper.cleanup_timeout * num_utterances + 1.0
+            print(f"Waiting {wait_time:.1f}s (extended for {num_utterances} utterances)...")
         else:
             wait_time = audio_duration + wrapper.cleanup_timeout + 1.0
             print(f"Waiting {wait_time:.1f}s...")
