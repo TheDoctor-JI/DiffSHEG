@@ -41,6 +41,16 @@ SAVE_WINDOWS flag:
 - To enable:
     DiffSHEGRealtimeWrapper.SAVE_WINDOWS = True
     wrapper = DiffSHEGRealtimeWrapper(...)
+
+USE_TEST_DATA_FOR_WINDOW flag:
+- When enabled, pre-loads the first window from a test audio file and uses it for ALL generations
+- Instead of using incoming audio chunks, always generates gestures from the same test window
+- Useful for isolating performance issues: if generation is fast with test data but slow with
+  real data, the problem is likely with the audio data format/content, not the generation pipeline
+- Test audio is loaded from: ../floor_coordinator/test_audio/test_audio.wav
+- To enable:
+    DiffSHEGRealtimeWrapper.USE_TEST_DATA_FOR_WINDOW = True
+    wrapper = DiffSHEGRealtimeWrapper(...)
 """
 
 import threading
@@ -269,6 +279,8 @@ class DiffSHEGRealtimeWrapper:
     # Global flag for controlling whether we allow stopping utterances
     ALLOW_STOPPING_UTTR = False
     
+    # Global flag for using pre-loaded test data for debugging
+    USE_TEST_DATA_FOR_WINDOW = True
 
     
     def __init__(
@@ -405,6 +417,12 @@ class DiffSHEGRealtimeWrapper:
         self._warmup_cuda_context()
         self.logger.info("CUDA context warmed up successfully")
 
+        # Load test data for debugging if enabled
+        self.test_audio_window = None
+        if self.USE_TEST_DATA_FOR_WINDOW:
+            self.logger.info("USE_TEST_DATA_FOR_WINDOW enabled - loading test audio...")
+            self._load_test_audio_window()
+
         # Audio feature extraction parameters (EXACTLY matching official test_custom_aud)
         # Official code: mel = librosa.feature.melspectrogram(y=aud, sr=18000, hop_length=1200, n_mels=128)
         # NO explicit n_fft, win_length, window, center, or power_to_db conversion!
@@ -470,6 +488,77 @@ class DiffSHEGRealtimeWrapper:
                 
         except Exception as e:
             self.logger.warning(f"CUDA warm-up failed (non-critical): {e}")
+
+    def _load_test_audio_window(self):
+        """
+        Load a window's worth of test audio data for debugging.
+        This loads the first window from a test audio file and stores it for repeated use.
+        """
+        try:
+            import librosa
+            
+            # Try to find test audio file
+            test_audio_path = None
+            possible_paths = [
+                # Try relative to this file
+                os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                    'floor_coordinator', 'test_audio', 'test_audio.wav'
+                ),
+                # Try relative to embodiment_manager
+                os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    '..', 'floor_coordinator', 'test_audio', 'test_audio.wav'
+                ),
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    test_audio_path = path
+                    break
+            
+            if test_audio_path is None:
+                self.logger.error("Could not find test audio file. USE_TEST_DATA_FOR_WINDOW will not work!")
+                self.test_audio_window = None
+                return
+            
+            self.logger.info(f"Loading test audio from: {test_audio_path}")
+            
+            # Load audio with librosa
+            audio, sr = librosa.load(test_audio_path, sr=None, mono=True)
+            
+            # Resample to target sample rate if needed
+            if sr != self.audio_sr:
+                self.logger.info(f"Resampling test audio from {sr} Hz to {self.audio_sr} Hz")
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=self.audio_sr)
+            
+            # Calculate how many samples we need for one window
+            window_duration_samples = int((self.window_size / self.gesture_fps) * self.audio_sr)
+            
+            # Extract first window
+            if len(audio) < window_duration_samples:
+                self.logger.warning(f"Test audio is too short ({len(audio)} samples), padding to {window_duration_samples}")
+                audio = np.pad(audio, (0, window_duration_samples - len(audio)), mode='constant')
+            
+            audio_window = audio[:window_duration_samples]
+            
+            # Convert to int16 and then to bytes (s16le format)
+            audio_int16 = (audio_window * 32767).astype(np.int16)
+            audio_bytes = audio_int16.tobytes()
+            
+            # Store the test audio window
+            self.test_audio_window = audio_bytes
+            
+            self.logger.info(
+                f"Test audio window loaded successfully: "
+                f"{len(audio_bytes)} bytes, {window_duration_samples} samples, "
+                f"{window_duration_samples / self.audio_sr:.3f} seconds"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load test audio window: {e}")
+            self.logger.exception(e)
+            self.test_audio_window = None
 
     def _save_audio_window(
         self,
@@ -1181,10 +1270,17 @@ class DiffSHEGRealtimeWrapper:
             
             # Step 2: Generate gestures without holding the lock
             if should_generate and len(audio_snapshot_full) > 0:
+                # Override with test audio if debugging flag is enabled
+                if self.USE_TEST_DATA_FOR_WINDOW and self.test_audio_window is not None:
+                    self.logger.debug(f"[TEST MODE] Using pre-loaded test audio window instead of real audio")
+                    audio_snapshot_full = self.test_audio_window
+                    # Reset context start to 0 since test window always starts from beginning
+                    audio_start_sample = 0
+                
                 # Generate gestures for this window
                 gen_start_time = time.time()
                 window = self._generate_gesture_window_from_audio(
-                    audio_snapshot_full,  # Pass audio context
+                    audio_snapshot_full,  # Pass audio context (or test data if flag enabled)
                     window_start_sample,
                     window_end_sample,
                     sample_rate,
@@ -1281,9 +1377,6 @@ class DiffSHEGRealtimeWrapper:
         """
         if len(audio_bytes_truncated) == 0 and precomputed_mel is None:
             return None
-        
-        audio_bytes_truncated = self.__normalize_audio_direct(audio_bytes_truncated)
-
 
         # ===== SAVE AUDIO WINDOW FOR DEBUGGING (if enabled) =====
         window_idx = int(round(window_start_sample / sample_rate * gesture_fps)) // self.window_step
