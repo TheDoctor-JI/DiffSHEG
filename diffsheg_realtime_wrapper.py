@@ -62,6 +62,7 @@ import hashlib
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger.logger import setup_logger
+import wave
 
 try:
     from trainers.ddpm_beat_trainer import get_hubert_from_16k_speech_long
@@ -119,7 +120,7 @@ class Utterance:
         
         # Audio storage: concatenated samples instead of chunks
         self.sample_rate = sample_rate
-        self.audio_samples: bytearray = bytearray()  # Concatenated raw audio samples (s16le encoded)
+        self.audio_samples: bytes = b''  # Concatenated raw audio samples (s16le encoded)
         self.bytes_per_sample = 2  # s16le encoding uses 2 bytes per sample
         
         # Generation state: tracks which audio window to generate next (in terms of sample indices)
@@ -153,7 +154,7 @@ class Utterance:
             raise TypeError(f"Unsupported audio_data type: {type(audio_data)}")
         
 
-        self.audio_samples.extend(audio_bytes)
+        self.audio_samples += audio_bytes
     
     def get_total_samples(self) -> int:
         """Get total number of audio samples accumulated."""
@@ -177,9 +178,9 @@ class Utterance:
         end_byte = min(end_byte, len(self.audio_samples))
         
         if start_byte >= len(self.audio_samples):
-            return bytes()
+            return b''
         
-        return bytes(self.audio_samples[start_byte:end_byte])
+        return self.audio_samples[start_byte:end_byte]
     
     def update_window_indices(self):
         """
@@ -1009,6 +1010,72 @@ class DiffSHEGRealtimeWrapper:
     Gesture generation scheduling
     '''
 
+    def __normalize_audio_via_wav_io(self, audio_bytes: bytes, sample_rate: int) -> bytes:
+        """
+        Normalize audio by saving to and reading from a temporary WAV file.
+        This mimics what the audio preprocessing module does and may fix format issues.
+        
+        Args:
+            audio_bytes: Raw audio bytes (s16le format)
+            sample_rate: Sample rate (e.g., 24000)
+        
+        Returns:
+            bytes: Normalized audio bytes after WAV I/O cycle
+        """
+        import tempfile
+        import os
+        
+        try:
+            # Create a temporary WAV file
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+                temp_path = temp_wav.name
+                
+                # Write audio to WAV file (this validates and normalizes the data)
+                with wave.open(temp_path, 'wb') as wav_file:
+                    wav_file.setnchannels(self.EXPECTED_CHANNELS)
+                    wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+                    wav_file.setframerate(sample_rate)
+                    wav_file.writeframes(audio_bytes)
+                
+                # Read audio back from WAV file
+                with wave.open(temp_path, 'rb') as wav_file:
+                    normalized_bytes = wav_file.readframes(wav_file.getnframes())
+            
+            # Clean up temporary file
+            os.unlink(temp_path)
+            
+            return normalized_bytes
+            
+        except Exception as e:
+            self.logger.error(f"Failed to normalize audio via WAV I/O: {e}")
+            return audio_bytes  # Return original if normalization fails
+
+    def __normalize_audio_direct(self, audio_bytes: bytes) -> bytes:
+        """
+        Normalize audio without file I/O by ensuring proper format.
+        """
+        try:
+            # Convert to numpy array
+            audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+            
+            # Ensure proper byte order and contiguity
+            audio_array = np.ascontiguousarray(audio_array, dtype=np.int16)
+            
+            # Convert back to bytes with explicit byte order
+            normalized_bytes = audio_array.tobytes()
+            
+            return normalized_bytes
+            
+
+            # """Ensure audio bytes are in contiguous memory with proper alignment."""
+            # audio_array = np.frombuffer(audio_bytes, dtype=np.int16).copy()
+            # return audio_array.tobytes()
+
+        except Exception as e:
+            self.logger.error(f"Failed to normalize audio directly: {e}")
+            return audio_bytes
+
+
     def _generation_loop(self):
         """
         Thread 2: Monitor available audio and trigger gesture generation windows.
@@ -1214,6 +1281,9 @@ class DiffSHEGRealtimeWrapper:
         if len(audio_bytes_truncated) == 0 and precomputed_mel is None:
             return None
         
+        audio_bytes_truncated = self.__normalize_audio_direct(audio_bytes_truncated)
+
+
         # ===== SAVE AUDIO WINDOW FOR DEBUGGING (if enabled) =====
         window_idx = int(round(window_start_sample / sample_rate * gesture_fps)) // self.window_step
         self._save_audio_window(
