@@ -69,8 +69,6 @@ except ImportError:
     get_hubert_from_16k_speech_long = None
 
 
-DEBUG_AUDIO_TRACE = True
-
 
 
 @dataclass
@@ -149,19 +147,6 @@ class Utterance:
             audio_data: Audio data as list of integers
         """
         if isinstance(audio_data, list):
-
-            if DEBUG_AUDIO_TRACE:
-                # --- START DEBUGGING CHANGE ---
-                # Check for out-of-range values before converting to bytes
-                invalid_values = [v for v in audio_data if not (0 <= v <= 255)]
-                if invalid_values:
-                    # This is a temporary logger for debugging, assuming a logger is available on the class
-                    # In a real scenario, you'd use self.logger if it exists.
-                    print(f"[ERROR] Utterance {self.utterance_id}: Found {len(invalid_values)} integers in audio_data list outside the valid byte range (0-255).")
-                    print(f"         Example invalid values: {invalid_values[:10]}")
-                # --- END DEBUGGING CHANGE ---
-
-
             # Convert list of integers to bytes (as in process_system_reference_audio)
             audio_bytes = bytes(audio_data)
         else:
@@ -280,8 +265,7 @@ class DiffSHEGRealtimeWrapper:
     # Global flag for saving audio windows for debugging
     SAVE_WINDOWS = False
     
-    # Debug flag for tracing audio chunk arrival
-    DEBUG_AUDIO_TRACE_SAMPLE_N = 16
+
     
     def __init__(
         self,
@@ -628,18 +612,6 @@ class DiffSHEGRealtimeWrapper:
             audio_data: Raw audio data (list of integers)
             duration: Optional duration of the chunk in seconds (not used internally, kept for API compatibility)
         """
-        # Optional tracing of incoming chunk before any conversion
-        if DEBUG_AUDIO_TRACE:
-            try:
-                b = bytes(audio_data) if isinstance(audio_data, list) else bytes()
-                md5 = hashlib.md5(b).hexdigest() if b else None
-                head = audio_data[:self.DEBUG_AUDIO_TRACE_SAMPLE_N] if isinstance(audio_data, list) else None
-                self.logger.debug(
-                    f"[TRACE:Wrapper recv] add_audio_chunk: utt={utterance_id} chunk={chunk_index} "
-                    f"lenB={len(b)} md5={md5} kind={'list' if isinstance(audio_data, list) else type(audio_data).__name__} head={head}"
-                )
-            except Exception as e:
-                self.logger.debug(f"[TRACE:Wrapper recv] checksum error: {e}")
 
         # Reject chunks for cancelled/timed-out utterances
         if utterance_id in self.cancelled_utterances:
