@@ -606,7 +606,7 @@ def main():
     EMULATE_2_UTTR = True
     
     # Where to split the audio (as fraction of total duration, 0.0 to 1.0)
-    SPLIT_FRACTION = 0.5  # Split at 50% of audio duration
+    SPLIT_FRACTION = 0.005  # Split at 50% of audio duration
     # ========================================================================
     
     # Parse arguments (mimicking the bash script)
@@ -710,7 +710,7 @@ def main():
     print(f"Total chunks: {len(chunks)}")
     
     # Stream chunks faster than realtime
-    playback_speed = 5.0  # faster than realtime
+    playback_speed = 10.0  # faster than realtime
     chunk_interval = chunk_duration / playback_speed
     
     print(f"\nStreaming chunks at {playback_speed}x speed (chunk every {chunk_interval:.3f}s)...")
@@ -741,13 +741,10 @@ def main():
             # Reset chunk index for new utterance
             chunk_index = i - split_chunk_idx
             
-            # Add a small delay when transitioning to simulate real utterance boundary
-            if i == split_chunk_idx:
-                print(f"\n{'='*70}")
-                print(f"SWITCHING TO UTTERANCE 2 (chunk {i})")
-                print(f"This triggers clear() which sets timing vars if ENAGLE_CLEARING_META2=True")
-                print(f"{'='*70}\n")
-                time.sleep(0.1)  # Small gap between utterances
+            if i == split_chunk_idx:##Throw a cancellation command
+                print('-'*80)
+                wrapper.stop_current_utterance(will_lock=True)
+                
         else:
             utterance_id = 1
             chunk_index = i

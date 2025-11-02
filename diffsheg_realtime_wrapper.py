@@ -70,6 +70,9 @@ from datetime import datetime
 import hashlib
 import gc
 import traceback
+import tempfile
+import os
+
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -85,7 +88,77 @@ except ImportError:
 
 ENABLE_CLEARING_CONTENT= True
 ENABLE_CLEARING_META1 = True
-ENAGLE_CLEARING_META2 = True
+ENAGLE_CLEARING_META2 = False
+DO_AUD_NORMALIZATION = False
+
+
+
+
+def normalize_audio_via_wav_io(audio_bytes: bytes, sample_rate: int) -> bytes:
+    """
+    Normalize audio by saving to and reading from a temporary WAV file.
+    This mimics what the audio preprocessing module does and may fix format issues.
+    
+    Args:
+        audio_bytes: Raw audio bytes (s16le format)
+        sample_rate: Sample rate (e.g., 24000)
+    
+    Returns:
+        bytes: Normalized audio bytes after WAV I/O cycle
+    """
+    
+    try:
+        # Create a temporary WAV file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+            temp_path = temp_wav.name
+            
+            # Write audio to WAV file (this validates and normalizes the data)
+            with wave.open(temp_path, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(audio_bytes)
+            
+            # Read audio back from WAV file
+            with wave.open(temp_path, 'rb') as wav_file:
+                normalized_bytes = wav_file.readframes(wav_file.getnframes())
+        
+        # Clean up temporary file
+        os.unlink(temp_path)
+        
+        return normalized_bytes
+        
+    except Exception as e:
+        print(f"Failed to normalize audio via WAV I/O: {e}")
+        return audio_bytes  # Return original if normalization fails
+
+def normalize_audio_direct(audio_bytes: bytes) -> bytes:
+    """
+    Normalize audio without file I/O by ensuring proper format.
+    """
+    try:
+        # Convert to numpy array
+        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+        
+        # Ensure proper byte order and contiguity
+        audio_array = np.ascontiguousarray(audio_array, dtype=np.int16)
+        
+        # Convert back to bytes with explicit byte order
+        normalized_bytes = audio_array.tobytes()
+        
+        return normalized_bytes
+        
+
+        # """Ensure audio bytes are in contiguous memory with proper alignment."""
+        # audio_array = np.frombuffer(audio_bytes, dtype=np.int16).copy()
+        # return audio_array.tobytes()
+
+    except Exception as e:
+        print(f"Failed to normalize audio directly: {e}")
+        return audio_bytes
+
+
+
 
 @dataclass
 class GestureWaypoint:
@@ -114,7 +187,6 @@ class WaypointWindow:
     window_index: int  # Sequential window index (0, 1, 2, ...)
     execution_waypoints: List[GestureWaypoint]  # Waypoints for execution (window_step frames)
     context_waypoints: List[GestureWaypoint]  # Waypoints for next window's inpainting (overlap_len frames)
-
 
 
 
@@ -170,7 +242,9 @@ class Utterance:
             audio_bytes = bytes(audio_data)
         else:
             raise TypeError(f"Unsupported audio_data type: {type(audio_data)}")
-        
+    
+        if DO_AUD_NORMALIZATION:
+            audio_bytes = normalize_audio_via_wav_io(audio_bytes, sample_rate=16000)
 
         self.audio_samples += audio_bytes
     
@@ -1141,72 +1215,6 @@ class DiffSHEGRealtimeWrapper:
     '''
     Gesture generation scheduling
     '''
-
-    def __normalize_audio_via_wav_io(self, audio_bytes: bytes, sample_rate: int) -> bytes:
-        """
-        Normalize audio by saving to and reading from a temporary WAV file.
-        This mimics what the audio preprocessing module does and may fix format issues.
-        
-        Args:
-            audio_bytes: Raw audio bytes (s16le format)
-            sample_rate: Sample rate (e.g., 24000)
-        
-        Returns:
-            bytes: Normalized audio bytes after WAV I/O cycle
-        """
-        import tempfile
-        import os
-        
-        try:
-            # Create a temporary WAV file
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
-                temp_path = temp_wav.name
-                
-                # Write audio to WAV file (this validates and normalizes the data)
-                with wave.open(temp_path, 'wb') as wav_file:
-                    wav_file.setnchannels(self.EXPECTED_CHANNELS)
-                    wav_file.setsampwidth(2)  # 16-bit = 2 bytes
-                    wav_file.setframerate(sample_rate)
-                    wav_file.writeframes(audio_bytes)
-                
-                # Read audio back from WAV file
-                with wave.open(temp_path, 'rb') as wav_file:
-                    normalized_bytes = wav_file.readframes(wav_file.getnframes())
-            
-            # Clean up temporary file
-            os.unlink(temp_path)
-            
-            return normalized_bytes
-            
-        except Exception as e:
-            self.logger.error(f"Failed to normalize audio via WAV I/O: {e}")
-            return audio_bytes  # Return original if normalization fails
-
-    def __normalize_audio_direct(self, audio_bytes: bytes) -> bytes:
-        """
-        Normalize audio without file I/O by ensuring proper format.
-        """
-        try:
-            # Convert to numpy array
-            audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-            
-            # Ensure proper byte order and contiguity
-            audio_array = np.ascontiguousarray(audio_array, dtype=np.int16)
-            
-            # Convert back to bytes with explicit byte order
-            normalized_bytes = audio_array.tobytes()
-            
-            return normalized_bytes
-            
-
-            # """Ensure audio bytes are in contiguous memory with proper alignment."""
-            # audio_array = np.frombuffer(audio_bytes, dtype=np.int16).copy()
-            # return audio_array.tobytes()
-
-        except Exception as e:
-            self.logger.error(f"Failed to normalize audio directly: {e}")
-            return audio_bytes
-
 
     def _generation_loop(self):
         """
