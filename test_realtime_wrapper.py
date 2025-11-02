@@ -4,16 +4,9 @@ Test script for DiffSHEG Realtime Wrapper
 TESTING MODES:
 ==============
 
-1. STREAMING MODE (default):
-   - DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = False
-   - Generates gestures in real-time as audio chunks arrive
-   - Uses incremental windowing with audio truncation for streaming
+- Generates gestures in real-time as audio chunks arrive
+- Uses incremental windowing with audio truncation for streaming
    
-2. NON-STREAMING SANITY CHECK MODE:
-   - DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
-   - Waits for complete audio before generating
-   - Uses same official generation pipeline but processes window-by-window
-   - Useful for debugging without streaming complexity
 
 DEBUGGING FLAGS:
 ===============
@@ -678,13 +671,7 @@ def main():
     # Initialize wrapper
     print("Initializing realtime wrapper...")
     
-    # Enable non-streaming sanity check mode
-    DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = False
     
-    print("="*60)
-    print(f"{'ENABLING' if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK else 'DISABLING'} NON_STREAMING_SANITY_CHECK MODE")
-    print("This will wait for full audio before generating using official pipeline")
-    print("="*60)
 
     # Waypoint collector - stores waypoints as they're generated
     collected_waypoints = []
@@ -871,24 +858,18 @@ def main():
         print(f"{'='*70}\n")
     
     # Wait for processing to complete
-    if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK:
-        print("\n[SANITY CHECK MODE] Waiting for audio completion and generation...")
-        # Wait for sanity check to complete
-        wrapper.sanity_check_generation_complete.wait()
-        print("[SANITY CHECK MODE] Generation complete!")
+    print("\nWaiting for gesture generation and playback to complete...")
+    # Wait for audio duration + cleanup timeout
+    if EMULATE_MULTI_UTTR:
+        # Need to wait for multiple utterances
+        num_utterances = len(utterance_boundaries)
+        wait_time = audio_duration + 2 * num_utterances + 1.0
+        print(f"Waiting {wait_time:.1f}s (extended for {num_utterances} utterances)...")
     else:
-        print("\nWaiting for gesture generation and playback to complete...")
-        # Wait for audio duration + cleanup timeout
-        if EMULATE_MULTI_UTTR:
-            # Need to wait for multiple utterances
-            num_utterances = len(utterance_boundaries)
-            wait_time = audio_duration + 2 * num_utterances + 1.0
-            print(f"Waiting {wait_time:.1f}s (extended for {num_utterances} utterances)...")
-        else:
-            wait_time = audio_duration + 2 + 1.0
-            print(f"Waiting {wait_time:.1f}s...")
-        time.sleep(wait_time)
-    
+        wait_time = audio_duration + 2 + 1.0
+        print(f"Waiting {wait_time:.1f}s...")
+    time.sleep(wait_time)
+
     # Stop wrapper
     print("\nStopping wrapper...")
     wrapper.stop()

@@ -4,31 +4,11 @@ DiffSHEG Realtime Wrapper for GPT-4o Dialogue System Integration
 This wrapper class manages the integration of DiffSHEG gesture generation with
 a real-time dialogue system that receives audio chunks from GPT-4o-realtime.
 
-OPERATING MODES:
-================
 
-The wrapper supports two operating modes via the NON_STREAMING_SANITY_CHECK flag:
-
-1. STREAMING MODE (default):
-   - NON_STREAMING_SANITY_CHECK = False
-   - Real-time gesture generation as audio chunks arrive
-   - Uses incremental windowing with overlap context
-   - Audio is truncated to [0, window_end] for each window generation
+- Real-time gesture generation as audio chunks arrive
+- Uses incremental windowing with overlap context
+- Audio is truncated to [0, window_end] for each window generation
    
-2. NON-STREAMING SANITY CHECK MODE:
-   - NON_STREAMING_SANITY_CHECK = True
-   - Waits for complete audio before generating
-   - Generates window by window with audio truncation
-   - Useful for debugging and comparing with official offline generation
-
-Both modes use the EXACT same official generation pipeline from DiffSHEG:
-- Official mel spectrogram extraction (librosa.feature.melspectrogram)
-- Official HuBERT feature extraction (get_hubert_from_16k_speech_long)
-- Official trainer.generate_batch() method with proper inpainting
-
-To enable sanity check mode, set the flag BEFORE creating the wrapper:
-    DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK = True
-    wrapper = DiffSHEGRealtimeWrapper(...)
 
 DEBUGGING FEATURES:
 ===================
@@ -206,7 +186,6 @@ class Utterance:
     ):
         self.utterance_id = utterance_id
         self.start_time: Optional[float] = Utterance.PLACE_HOLDER_TIMESTAMP
-        self.last_chunk_received_time: float = Utterance.PLACE_HOLDER_TIMESTAMP # Track when last chunk arrived
         
         # Audio storage: concatenated samples instead of chunks
         self.sample_rate = sample_rate
@@ -312,8 +291,6 @@ class Utterance:
                 self.next_window_start_sample = 0
                 self.next_window_end_sample = window_duration_samples
 
-                self.last_chunk_received_time = Utterance.PLACE_HOLDER_TIMESTAMP
-
                 
             if ENAGLE_CLEARING_META2:
                 # Clear timing information
@@ -374,19 +351,11 @@ class DiffSHEGRealtimeWrapper:
     - Manages two threads: playback monitoring and gesture generation
     - Generation thread uses snapshot-based approach for lock-free inference
     
-    NON_STREAMING_SANITY_CHECK mode:
-    - When enabled, waits for full audio before generating
-    - Useful for debugging and comparing with official offline generation
-    - When False (default), operates in streaming mode for real-time interaction
-    
     USE_CONSTRAINED_FEATURES mode:
     - When False (default), streaming mode computes features from [0, window_end]
     - When True, constrains audio context to AUDIO_DUR_FOR_FEATURES seconds
     - This ensures stable performance regardless of utterance length
     """
-    
-    # Global flag for sanity check mode
-    NON_STREAMING_SANITY_CHECK = False
     
     # Global flags for constrained feature extraction
     USE_CONSTRAINED_FEATURES = True
@@ -753,32 +722,20 @@ class DiffSHEGRealtimeWrapper:
         self.running = True
         
         # Log mode information
-        if DiffSHEGRealtimeWrapper.NON_STREAMING_SANITY_CHECK:
-            self.logger.info("="*60)
-            self.logger.info("SANITY CHECK MODE: NON-STREAMING")
-            self.logger.info("Using wrapper's own generation pipeline")
-            self.logger.info("="*60)
+        self.logger.info("="*60)
+        self.logger.info("STREAMING MODE: Real-time generation")
+        if DiffSHEGRealtimeWrapper.USE_CONSTRAINED_FEATURES:
+            self.logger.info(f"CONSTRAINED FEATURES: Enabled (duration={DiffSHEGRealtimeWrapper.AUDIO_DUR_FOR_FEATURES}s)")
         else:
-            self.logger.info("="*60)
-            self.logger.info("STREAMING MODE: Real-time generation")
-            if DiffSHEGRealtimeWrapper.USE_CONSTRAINED_FEATURES:
-                self.logger.info(f"CONSTRAINED FEATURES: Enabled (duration={DiffSHEGRealtimeWrapper.AUDIO_DUR_FOR_FEATURES}s)")
-            else:
-                self.logger.info("CONSTRAINED FEATURES: Disabled (using full audio context)")
-            self.logger.info("="*60)
+            self.logger.info("CONSTRAINED FEATURES: Disabled (using full audio context)")
+        self.logger.info("="*60)
         
-        if self.NON_STREAMING_SANITY_CHECK:
-            # Sanity check mode: monitor audio completion, then generate all at once
-            self.sanity_check_thread = threading.Thread(target=self._sanity_check_loop, daemon=True)
-            self.sanity_check_thread.start()
-            self.logger.info("NON_STREAMING_SANITY_CHECK mode enabled - waiting for full audio before generation")
-        else:
-            # Normal streaming mode
-            self.playback_managing_thread = threading.Thread(target=self._playback_managing_loop, daemon=True)
-            self.generation_thread = threading.Thread(target=self._generation_loop, daemon=True)
-            self.playback_managing_thread.start()
-            self.generation_thread.start()
-            self.logger.info("Playback managing and generation threads started")
+        # Normal streaming mode
+        self.playback_managing_thread = threading.Thread(target=self._playback_managing_loop, daemon=True)
+        self.generation_thread = threading.Thread(target=self._generation_loop, daemon=True)
+        self.playback_managing_thread.start()
+        self.generation_thread.start()
+        self.logger.info("Playback managing and generation threads started")
         
     def stop(self):
         """Stop the wrapper threads."""
@@ -850,11 +807,7 @@ class DiffSHEGRealtimeWrapper:
                 ## By the time the chunk arrive, the playback of this utterance would have started (roughly)
                 self.current_utterance.start_time = curren_time
                 self.logger.info(f"Utterance object changed to new id={utterance_id}, playback should have started.")
-            
-            # Update last chunk received time
-            self.current_utterance.last_chunk_received_time = curren_time
-            
-
+                        
             # Add audio samples to utterance
             audio_samples_before = self.current_utterance.get_total_samples()
             self.current_utterance.add_audio_samples(audio_data)
@@ -967,65 +920,7 @@ class DiffSHEGRealtimeWrapper:
     Sanity check mode: Non-streaming batch generation
     '''
     
-    def _sanity_check_loop(self):
-        """
-        Sanity check thread: Wait for all audio, then generate all waypoints at once.
-        
-        This mode tests the generation logic in a non-streaming setting, similar to
-        the official offline generation. It helps isolate whether issues are due to
-        the core generation or the streaming/windowing approach.
-        
-        Process:
-        1. Monitor audio chunks and wait for completion (no new chunks for threshold)
-        2. Generate all windows using FULL audio context (not limited to window end)
-        3. Execute all waypoints through callback for saving/visualization
-        """
-        audio_complete_threshold = 0.5  # Wait 500ms after last chunk
-        
-        while self.running:
-            time.sleep(0.1)  # 100ms tick
-            
-            # Wait for audio to start arriving
-            with self.utterance_lock:
-                if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID or self.current_utterance.start_time == Utterance.PLACE_HOLDER_TIMESTAMP:
-                    continue
-            
-            # Monitor for audio completion
-            while self.running:
-                time.sleep(0.05)
-                
-                with self.utterance_lock:
 
-                    if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID:
-                        break
-                    
-                    # Check if we've stopped receiving chunks
-                    if self.current_utterance.last_chunk_received_time == Utterance.PLACE_HOLDER_TIMESTAMP:
-                        time_since_last_chunk = time.time() - self.current_utterance.last_chunk_received_time
-                        if time_since_last_chunk >= audio_complete_threshold:
-                            # Audio is complete!
-                            utterance_id = self.current_utterance.utterance_id
-                            total_samples = self.current_utterance.get_total_samples()
-                            audio_duration = total_samples / self.current_utterance.sample_rate
-                            
-                            self.logger.info(
-                                f"[SANITY CHECK] Utterance {utterance_id} audio complete: "
-                                f"{total_samples} samples ({audio_duration:.2f}s)"
-                            )
-                            
-                            # Signal that audio is complete
-                            self.sanity_check_audio_complete.set()
-                            break
-            
-            # Now generate all windows using FULL audio
-            if self.sanity_check_audio_complete.is_set():
-                self.logger.info("[SANITY CHECK] Starting full-audio generation...")
-                self._sanity_check_generate_all()
-                # Signal completion AFTER all waypoints have been executed
-                self.logger.info("[SANITY CHECK] Signaling generation complete")
-                self.sanity_check_generation_complete.set()
-                break
-    
     def _extract_audio_features(self, audio_bytes: bytes, sample_rate: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Extract mel spectrogram and HuBERT features from audio bytes.
@@ -1081,114 +976,7 @@ class DiffSHEGRealtimeWrapper:
         
         return audio_emb, hubert_feat
     
-    def _sanity_check_generate_all(self):
-        """
-        Generate all windows for the current utterance using full audio context.
-        
-        In non-streaming sanity check mode, we extract mel/HuBERT features ONCE for the full audio
-        (like the official runner), then window them for each generation. This is more efficient
-        and matches the official runner behavior exactly.
-        """
-        with self.utterance_lock:
-
-            if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID:
-                return
-            
-            utterance_id = self.current_utterance.utterance_id
-            total_samples = self.current_utterance.get_total_samples()
-            sample_rate = self.current_utterance.sample_rate
-            gesture_fps = self.current_utterance.gesture_fps
-            
-            # Get FULL audio
-            full_audio_bytes = self.current_utterance.get_audio_window(0, total_samples)
-            
-            self.logger.info(
-                f"[SANITY CHECK] Generating all windows for utterance {utterance_id}: "
-                f"total_samples={total_samples}, duration={total_samples/sample_rate:.2f}s"
-            )
-        
-        # ===== STEP 1: Extract features ONCE for the full audio (like official runner) =====
-        self.logger.info("[SANITY CHECK] Extracting mel/HuBERT features for full audio...")
-        audio_emb, hubert_feat = self._extract_audio_features(full_audio_bytes, sample_rate)
-        self.logger.info(f"[SANITY CHECK] Mel features extracted: shape={audio_emb.shape}")
-        if hubert_feat is not None:
-            self.logger.info(f"[SANITY CHECK] HuBERT features extracted: shape={hubert_feat.shape}")
-        
-        # ===== STEP 2: Generate all windows by windowing the precomputed features =====
-        all_waypoints = []
-        all_window_outputs = []  # Collect raw outputs for export
-        overlap_context = None
-        
-        window_start_sample = 0
-        window_end_sample = int((self.window_size / gesture_fps) * sample_rate)
-        
-        window_idx = 0
-        while window_start_sample < total_samples:
-            self.logger.info(
-                f"[SANITY CHECK] Generating window {window_idx}: "
-                f"samples [{window_start_sample}-{window_end_sample}]"
-            )
-            
-            # Generate this window using precomputed features
-            # Pass empty bytes since we're using precomputed features
-            window = self._generate_gesture_window_from_audio(
-                b'',  # Not used when precomputed features are provided
-                window_start_sample,
-                min(window_end_sample, total_samples),
-                sample_rate,
-                gesture_fps,
-                overlap_context,
-                utterance_id,
-                precomputed_mel=audio_emb,
-                precomputed_hubert=hubert_feat
-            )
-            
-            if window is None:
-                break
-            
-            # Collect execution waypoints for export
-            all_waypoints.extend(window.execution_waypoints)
-            
-            # Collect gesture data from execution waypoints for export
-            execution_data = np.array([wp.gesture_data for wp in window.execution_waypoints])  # Shape: (window_step, C)
-            all_window_outputs.append(execution_data)
-            
-            # Update overlap context for next window using context waypoints
-            if self.overlap_len > 0 and window.context_waypoints:
-                # Extract gesture data from context waypoints (frames 30-33 of the window)
-                overlap_context = [deepcopy(wp.gesture_data) for wp in window.context_waypoints]
-                self.logger.debug(f"[SANITY CHECK] Updated overlap context with {len(overlap_context)} frames from window {window.window_index}")
-            
-            # Advance window
-            window_start_sample += int((self.window_step / gesture_fps) * sample_rate)
-            window_end_sample = window_start_sample + int((self.window_size / gesture_fps) * sample_rate)
-            window_idx += 1
-        
-        self.logger.info(
-            f"[SANITY CHECK] Generated {len(all_waypoints)} total waypoints "
-            f"from {window_idx} windows"
-        )
-        
-        # Concatenate all window outputs and store for export (matching reference pipeline)
-        if all_window_outputs:
-            out_motions = np.concatenate(all_window_outputs, axis=0)  # Shape: (T, C)
-            out_motions = np.expand_dims(out_motions, axis=0)  # Shape: (1, T, C) to match reference pipeline
-            self.last_generated_motion = torch.from_numpy(out_motions)
-            self.logger.info(f"[SANITY CHECK] Stored generated motion for export: shape={out_motions.shape}")
-        else:
-            self.last_generated_motion = None
-            self.logger.warning("[SANITY CHECK] No window outputs generated, cannot store motion for export")
-        
-        # Execute all waypoints through callback BEFORE signaling completion
-        if self.waypoint_callback is not None:
-            self.logger.info("[SANITY CHECK] Executing all waypoints through callback...")
-            for waypoint in all_waypoints:
-                self.waypoint_callback(waypoint)
-                time.sleep(0.01)  
-            self.logger.info("[SANITY CHECK] All waypoints executed")
-        else:
-            self.logger.warning("[SANITY CHECK] No waypoint callback provided, waypoints not executed")
-
+    
     '''
     Gesture generation scheduling
     '''
