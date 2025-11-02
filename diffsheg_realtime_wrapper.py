@@ -184,8 +184,9 @@ class Utterance:
         start_byte = start_sample * self.bytes_per_sample
         end_byte = end_sample * self.bytes_per_sample
         
-        # Clamp to available data
-        end_byte = min(end_byte, len(self.audio_samples))
+        if len(self.audio_samples) < end_byte:
+            raise RuntimeError('Insufficient audio bytes!')
+        
         
         if start_byte >= len(self.audio_samples):
             return b''
