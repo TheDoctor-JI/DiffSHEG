@@ -68,7 +68,7 @@ except ImportError:
 
 ENABLE_CLEARING_CONTENT= True
 ENABLE_CLEARING_META1 = True
-ENAGLE_CLEARING_META2 = False
+ENAGLE_CLEARING_META2 = True
 DO_AUD_NORMALIZATION = False
 
 
@@ -976,7 +976,7 @@ class DiffSHEGRealtimeWrapper:
         
         return audio_emb, hubert_feat
     
-    
+
     '''
     Gesture generation scheduling
     '''
