@@ -73,6 +73,7 @@ import hashlib
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger.logger import setup_logger
 import wave
+from copy import deepcopy
 
 try:
     from trainers.ddpm_beat_trainer import get_hubert_from_16k_speech_long
@@ -80,7 +81,7 @@ except ImportError:
     get_hubert_from_16k_speech_long = None
 
 
-
+ENABLE_CLEARNING = True
 
 @dataclass
 class GestureWaypoint:
@@ -216,26 +217,28 @@ class Utterance:
         Clear all content of the utterance for reuse.
         This resets all data structures while keeping the object alive.
         """
-        with self.waypoints_lock:
+        
+        if ENABLE_CLEARNING:
+            with self.waypoints_lock:
 
-            self.utterance_id = -1  # Reset to placeholder ID
+                self.utterance_id = -1  # Reset to placeholder ID
 
-            # Clear audio data
-            self.audio_samples = b''
+                # Clear audio data
+                self.audio_samples = b''
             
-            # Clear timing information
-            self.start_time = None
-            self.last_chunk_received_time = None
-            
-            # Reset window indices to start from sample 0
-            window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
-            self.next_window_start_sample = 0
-            self.next_window_end_sample = window_duration_samples
-            
-            # Clear gesture data structures
-            self.windows.clear()
-            self.execution_waypoints.clear()
-            self.last_executed_waypoint_index = -1
+                # Clear timing information
+                self.start_time = None
+                self.last_chunk_received_time = None
+                
+                # Reset window indices to start from sample 0
+                window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
+                self.next_window_start_sample = 0
+                self.next_window_end_sample = window_duration_samples
+                
+                # Clear gesture data structures
+                self.windows = []  # Create new list instead of .clear()
+                self.execution_waypoints = []  # Create new list
+                self.last_executed_waypoint_index = -1
     
     def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
@@ -305,7 +308,6 @@ class DiffSHEGRealtimeWrapper:
 
     # Global flag for controlling whether we allow stopping utterances
     ALLOW_STOPPING_UTTR = True
-    DEBUG_SKIP_STOPPING_LOGIC = False
     
     # Global flag for using pre-loaded test data for debugging
     USE_TEST_DATA_FOR_WINDOW = False
@@ -763,9 +765,9 @@ class DiffSHEGRealtimeWrapper:
                 ## Stop the old utterance if it exists
                 self.stop_current_utterance(will_lock=False)
                 
-                # Update utterance ID for the new utterance (object is already cleared by stop_current_utterance)
+                # Update utterance ID for the new utterance
                 self.current_utterance.utterance_id = utterance_id
-                self.logger.info(f"Utterance object reused with new id={utterance_id}")
+                self.logger.info(f"Utterance object changed to new id={utterance_id}")
             
             
             # Update last chunk received time
@@ -802,7 +804,7 @@ class DiffSHEGRealtimeWrapper:
         try:
             if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR:
                 # Add to stopped set to reject any late-arriving chunks
-                if (not DiffSHEGRealtimeWrapper.DEBUG_SKIP_STOPPING_LOGIC) and self.current_utterance.utterance_id != -1:
+                if self.current_utterance.utterance_id != -1:
                     self.stopped_utterances.add(self.current_utterance.utterance_id)
                     
                     # Clear the utterance content but keep the object alive
@@ -1091,7 +1093,7 @@ class DiffSHEGRealtimeWrapper:
             # Update overlap context for next window using context waypoints
             if self.overlap_len > 0 and window.context_waypoints:
                 # Extract gesture data from context waypoints (frames 30-33 of the window)
-                overlap_context = [wp.gesture_data.copy() for wp in window.context_waypoints]
+                overlap_context = [deepcopy(wp.gesture_data) for wp in window.context_waypoints]
                 self.logger.debug(f"[SANITY CHECK] Updated overlap context with {len(overlap_context)} frames from window {window.window_index}")
             
             # Advance window
@@ -1293,7 +1295,7 @@ class DiffSHEGRealtimeWrapper:
                         prev_window = self.current_utterance.windows[-1]
                         # Use the context waypoints from previous window (frames 30-33)
                         if prev_window.context_waypoints:
-                            overlap_context = [wp.gesture_data.copy() for wp in prev_window.context_waypoints]
+                            overlap_context = [deepcopy(wp.gesture_data) for wp in prev_window.context_waypoints]
                             self.logger.debug(f"Utterance {utterance_id} using overlap context from previous window {prev_window.window_index}")
             
             # Step 2: Generate gestures without holding the lock
@@ -1495,6 +1497,12 @@ class DiffSHEGRealtimeWrapper:
         # ===== STEP 8: Generate using official trainer method =====
         self.logger.debug('Starting generation for the window.')
         with torch.no_grad():
+
+            ## Ensure previous operations are complete without blocking
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)  # Clear any pending ops
+            
+
             outputs = self.model.generate_batch(
                 audio_window, p_id, C, add_cond, inpaint_dict
             )
