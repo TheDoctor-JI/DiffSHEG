@@ -211,6 +211,32 @@ class Utterance:
             # Add all execution waypoints to the flat list for playback
             self.execution_waypoints.extend(window.execution_waypoints)
     
+    def clear(self):
+        """
+        Clear all content of the utterance for reuse.
+        This resets all data structures while keeping the object alive.
+        """
+        with self.waypoints_lock:
+
+            self.utterance_id = -1  # Reset to placeholder ID
+
+            # Clear audio data
+            self.audio_samples = b''
+            
+            # Clear timing information
+            self.start_time = None
+            self.last_chunk_received_time = None
+            
+            # Reset window indices to start from sample 0
+            window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
+            self.next_window_start_sample = 0
+            self.next_window_end_sample = window_duration_samples
+            
+            # Clear gesture data structures
+            self.windows.clear()
+            self.execution_waypoints.clear()
+            self.last_executed_waypoint_index = -1
+    
     def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
         Find the waypoint that should be executed in the next interval.
@@ -278,10 +304,11 @@ class DiffSHEGRealtimeWrapper:
     SAVE_WINDOWS = False
 
     # Global flag for controlling whether we allow stopping utterances
-    ALLOW_STOPPING_UTTR = False
+    ALLOW_STOPPING_UTTR = True
+    DEBUG_SKIP_STOPPING_LOGIC = False
     
     # Global flag for using pre-loaded test data for debugging
-    USE_TEST_DATA_FOR_WINDOW = True
+    USE_TEST_DATA_FOR_WINDOW = False
 
     
     def __init__(
@@ -382,9 +409,25 @@ class DiffSHEGRealtimeWrapper:
             self.hubert_model = None
             self.logger.info("HuBERT features disabled")
         
-        # Current utterance tracking (only keep the latest)
-        self.current_utterance: Optional[Utterance] = None
+        # DiffSHEG configuration (needed before creating utterance)
+        self.window_size = opt.n_poses  # e.g., 34 frames
+        self.overlap_len = opt.overlap_len  # e.g., 4 frames
+        self.window_step = self.window_size - self.overlap_len
+        
+        # Compute frames per audio second
+        # DiffSHEG uses 15 FPS for BEAT dataset
+        self.gesture_fps = 15
+        
+        # Current utterance tracking (created once and reused)
+        self.current_utterance: Utterance = Utterance(
+            utterance_id=-1,  # Placeholder ID, will be updated when first chunk arrives
+            sample_rate=self.audio_sr,
+            gesture_fps=self.gesture_fps,
+            window_size=self.window_size,
+            window_step=self.window_step
+        )
         self.utterance_lock = threading.Lock()
+        self.logger.info("Persistent utterance object created (will be reused)")
         
         # Track stopped/timed-out utterances to reject late-arriving chunks
         self.stopped_utterances: set = set()  # Set of utterance_ids that have been stopped or timed out
@@ -401,15 +444,6 @@ class DiffSHEGRealtimeWrapper:
         
         # Store last generated motion (for avoiding regeneration during export)
         self.last_generated_motion = None
-        
-        # DiffSHEG configuration
-        self.window_size = opt.n_poses  # e.g., 34 frames
-        self.overlap_len = opt.overlap_len  # e.g., 4 frames
-        self.window_step = self.window_size - self.overlap_len
-        
-        # Compute frames per audio second
-        # DiffSHEG uses 15 FPS for BEAT dataset
-        self.gesture_fps = 15
         
         self.logger.info(f"DiffSHEG parameters: window_size={self.window_size}, overlap={self.overlap_len}, step={self.window_step}, fps={self.gesture_fps}")
 
@@ -686,17 +720,13 @@ class DiffSHEGRealtimeWrapper:
         """
         Reset all state-related variables.
         
-        This clears the current utterance and stopped history.
+        This clears the current utterance content and stopped history.
         Useful for starting fresh or cleaning up after a session ends.
         """
         with self.utterance_lock:
-            old_utterance_id = self.current_utterance.utterance_id if self.current_utterance else None
-            self.current_utterance = None
+            self.current_utterance.clear()
             self.stopped_utterances.clear()
-        
-        if old_utterance_id is not None:
-            self.logger.info(f"Context reset: cleared utterance {old_utterance_id} and stopped history")
-    
+
     '''
     Utterance lifecycle methods
     '''
@@ -727,21 +757,16 @@ class DiffSHEGRealtimeWrapper:
             if utterance_id in self.stopped_utterances:
                 return
             
-            # If this is a new utterance, discard the old one
-            if self.current_utterance is None or (DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR and self.current_utterance.utterance_id != utterance_id):
+            # If this is a new utterance, clear the old one and update ID
+            if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR and self.current_utterance.utterance_id != utterance_id:
                 
                 ## Stop the old utterance if it exists
                 self.stop_current_utterance(will_lock=False)
                 
-                ## Create a new utterance
-                self.current_utterance = Utterance(
-                    utterance_id=utterance_id,
-                    sample_rate=self.audio_sr,
-                    gesture_fps=self.gesture_fps,
-                    window_size=self.window_size,
-                    window_step=self.window_step
-                )
-                self.logger.info(f"New utterance created: id={utterance_id}")
+                if not DiffSHEGRealtimeWrapper.DEBUG_SKIP_STOPPING_LOGIC:
+                    # Update utterance ID for the new utterance (object is already cleared by stop_current_utterance)
+                    self.current_utterance.utterance_id = utterance_id
+                    self.logger.info(f"Utterance object reused with new id={utterance_id}")
             
             
             # Update last chunk received time
@@ -762,11 +787,11 @@ class DiffSHEGRealtimeWrapper:
     
     def stop_current_utterance(self, will_lock = True):
         """
-        Cancel the ongoing utterance and discard its audio chunks and generated gestures.
+        Clear the current utterance content and prepare it for reuse.
         
         Since gesture generation is faster than realtime, it's safe to simply
-        discard the current utterance and all its waypoints when stopped.
-        The system will start fresh with the next utterance.
+        clear the current utterance and all its waypoints when stopped.
+        The system will start fresh with the next utterance using the same object.
         
         This also prevents late-arriving chunks for this utterance from being
         processed by tracking stopped utterance IDs in a set.
@@ -776,19 +801,23 @@ class DiffSHEGRealtimeWrapper:
             self.utterance_lock.acquire()
 
         try:
-            # Add to stopped set to reject any late-arriving chunks
-            if self.current_utterance is not None:
-                self.stopped_utterances.add(self.current_utterance.utterance_id)
-                
-                # Then, simply discard everything - generation is faster than realtime
-                # so we can regenerate from scratch for the next utterance
-                total_samples = self.current_utterance.get_total_samples()
-                self.logger.debug(f"Stop utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
-                del self.current_utterance
-                self.current_utterance = None
+            if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR:
+                # Add to stopped set to reject any late-arriving chunks
+                if (not DiffSHEGRealtimeWrapper.DEBUG_SKIP_STOPPING_LOGIC) and self.current_utterance is not None:
+                    self.stopped_utterances.add(self.current_utterance.utterance_id)
+                    
+                    # Clear the utterance content but keep the object alive
+                    total_samples = self.current_utterance.get_total_samples()
+                    self.logger.debug(f"Stop utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
+                    
+                    # Clear all content for reuse
+                    self.current_utterance.clear()
+                    
+
+
 
         except Exception as e:
-            self.logger.error(f'Failed to stop uttterance with exception:{e}')
+            self.logger.error(f'Failed to stop utterance with exception:{e}')
 
         finally:
             if will_lock:
@@ -825,37 +854,37 @@ class DiffSHEGRealtimeWrapper:
             should_cleanup = False
             
             with self.utterance_lock:
-                utterance = self.current_utterance
                 
-                if utterance is None:
+                # Skip if no valid utterance (placeholder ID -1)
+                if self.current_utterance.utterance_id == -1:
                     continue
                 
                 # Skip if playback hasn't started yet (no chunk 0 received)
-                if utterance.start_time is None:
+                if self.current_utterance.start_time is None:
                     continue
                 
                 # Calculate current playback position (time relative to utterance start)
-                elapsed_time = iteration_start_time - utterance.start_time
+                elapsed_time = iteration_start_time - self.current_utterance.start_time
                 
                 # Calculate total audio duration received so far
-                total_samples = utterance.get_total_samples()
-                total_audio_duration = total_samples / utterance.sample_rate
+                total_samples = self.current_utterance.get_total_samples()
+                total_audio_duration = total_samples / self.current_utterance.sample_rate
                 
 
                 # Auto-cleanup: if playback has passed all audio AND no new chunks for cleanup_timeout
                 if elapsed_time > total_audio_duration:
-                    time_since_last_chunk = iteration_start_time - utterance.last_chunk_received_time
+                    time_since_last_chunk = iteration_start_time - self.current_utterance.last_chunk_received_time
                     if time_since_last_chunk > self.cleanup_timeout:
                         should_cleanup = True
                 
                 # Check for waypoint to execute in the next 10ms interval
-                waypoint = utterance.get_waypoint_for_interval(
+                waypoint = self.current_utterance.get_waypoint_for_interval(
                     current_time=elapsed_time,
                     interval_duration=interval_duration
                 )
                 if waypoint is not None:
                     # Execute waypoint gesture
-                    self.logger.debug(f"Utterance {utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
+                    self.logger.debug(f"Utterance {self.current_utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
                     # Call the waypoint callback if provided
                     if self.waypoint_callback is not None:
                         self.waypoint_callback(waypoint)
@@ -894,8 +923,7 @@ class DiffSHEGRealtimeWrapper:
             
             # Wait for audio to start arriving
             with self.utterance_lock:
-                utterance = self.current_utterance
-                if utterance is None or utterance.start_time is None:
+                if self.current_utterance.utterance_id == -1 or self.current_utterance.start_time is None:
                     continue
             
             # Monitor for audio completion
@@ -903,18 +931,18 @@ class DiffSHEGRealtimeWrapper:
                 time.sleep(0.05)
                 
                 with self.utterance_lock:
-                    utterance = self.current_utterance
-                    if utterance is None:
+
+                    if self.current_utterance.utterance_id == -1:
                         break
                     
                     # Check if we've stopped receiving chunks
-                    if utterance.last_chunk_received_time is not None:
-                        time_since_last_chunk = time.time() - utterance.last_chunk_received_time
+                    if self.current_utterance.last_chunk_received_time is not None:
+                        time_since_last_chunk = time.time() - self.current_utterance.last_chunk_received_time
                         if time_since_last_chunk >= audio_complete_threshold:
                             # Audio is complete!
-                            utterance_id = utterance.utterance_id
-                            total_samples = utterance.get_total_samples()
-                            audio_duration = total_samples / utterance.sample_rate
+                            utterance_id = self.current_utterance.utterance_id
+                            total_samples = self.current_utterance.get_total_samples()
+                            audio_duration = total_samples / self.current_utterance.sample_rate
                             
                             self.logger.info(
                                 f"[SANITY CHECK] Utterance {utterance_id} audio complete: "
@@ -998,17 +1026,17 @@ class DiffSHEGRealtimeWrapper:
         and matches the official runner behavior exactly.
         """
         with self.utterance_lock:
-            utterance = self.current_utterance
-            if utterance is None:
+
+            if self.current_utterance.utterance_id == -1:
                 return
             
-            utterance_id = utterance.utterance_id
-            total_samples = utterance.get_total_samples()
-            sample_rate = utterance.sample_rate
-            gesture_fps = utterance.gesture_fps
+            utterance_id = self.current_utterance.utterance_id
+            total_samples = self.current_utterance.get_total_samples()
+            sample_rate = self.current_utterance.sample_rate
+            gesture_fps = self.current_utterance.gesture_fps
             
             # Get FULL audio
-            full_audio_bytes = utterance.get_audio_window(0, total_samples)
+            full_audio_bytes = self.current_utterance.get_audio_window(0, total_samples)
             
             self.logger.info(
                 f"[SANITY CHECK] Generating all windows for utterance {utterance_id}: "
@@ -1203,25 +1231,25 @@ class DiffSHEGRealtimeWrapper:
             overlap_context = None  # Snapshot of overlap waypoints for smooth transitions
             
             with self.utterance_lock:
-                utterance = self.current_utterance
                 
-                if utterance is None:
+                # Skip if no valid utterance (placeholder ID -1)
+                if self.current_utterance.utterance_id == -1:
                     continue
                 
                 # Check if we have enough samples for the next window
-                available_samples = utterance.get_total_samples()
+                available_samples = self.current_utterance.get_total_samples()
                 
-                if available_samples < utterance.next_window_end_sample:
+                if available_samples < self.current_utterance.next_window_end_sample:
                     # Not enough samples yet, wait for more
                     continue
                 
                 # We have enough samples, prepare to generate
                 should_generate = True
-                utterance_id = utterance.utterance_id
-                window_start_sample = utterance.next_window_start_sample
-                window_end_sample = utterance.next_window_end_sample
-                sample_rate = utterance.sample_rate
-                gesture_fps = utterance.gesture_fps
+                utterance_id = self.current_utterance.utterance_id
+                window_start_sample = self.current_utterance.next_window_start_sample
+                window_end_sample = self.current_utterance.next_window_end_sample
+                sample_rate = self.current_utterance.sample_rate
+                gesture_fps = self.current_utterance.gesture_fps
                 
                 # Determine audio snapshot range based on USE_CONSTRAINED_FEATURES flag
                 if self.USE_CONSTRAINED_FEATURES:
@@ -1230,7 +1258,7 @@ class DiffSHEGRealtimeWrapper:
                     # Take audio from [window_end - constrained_samples, window_end]
                     # But ensure we don't go negative
                     audio_start_sample = max(0, window_end_sample - constrained_samples)
-                    audio_snapshot_full = utterance.get_audio_window(audio_start_sample, window_end_sample)
+                    audio_snapshot_full = self.current_utterance.get_audio_window(audio_start_sample, window_end_sample)
                     
                     window_duration = (window_end_sample - window_start_sample) / sample_rate
                     constrained_duration = (window_end_sample - audio_start_sample) / sample_rate
@@ -1245,7 +1273,7 @@ class DiffSHEGRealtimeWrapper:
                     # This is needed because mel/HuBERT features must be computed over full context
                     # Following official code pattern: compute features for entire audio, then window them
                     audio_start_sample = 0
-                    audio_snapshot_full = utterance.get_audio_window(0, window_end_sample)
+                    audio_snapshot_full = self.current_utterance.get_audio_window(0, window_end_sample)
                     
                     window_duration = (window_end_sample - window_start_sample) / sample_rate
                     self.logger.debug(
@@ -1262,8 +1290,8 @@ class DiffSHEGRealtimeWrapper:
                 
                 if self.overlap_len > 0 and window_start_frame > 0:
                     # We need overlap context from the previous window's context waypoints
-                    if utterance.windows:
-                        prev_window = utterance.windows[-1]
+                    if self.current_utterance.windows:
+                        prev_window = self.current_utterance.windows[-1]
                         # Use the context waypoints from previous window (frames 30-33)
                         if prev_window.context_waypoints:
                             overlap_context = [wp.gesture_data.copy() for wp in prev_window.context_waypoints]
@@ -1299,20 +1327,20 @@ class DiffSHEGRealtimeWrapper:
                     utterance = self.current_utterance
                     
                     # Check if this utterance is still current (not stopped)
-                    if utterance is None or utterance.utterance_id != utterance_id:
+                    if self.current_utterance.utterance_id != utterance_id:
                         # Utterance was stopped, discard window
                         self.logger.debug(f"Utterance {utterance_id} was stopped during generation, discarding window")
                         continue
                     
                     # Add window to utterance (this also adds execution waypoints to flat list)
                     if window:
-                        utterance.add_window(window)
-                        self.logger.debug(f"Utterance {utterance_id} window {window.window_index} added: total windows={len(utterance.windows)}, total execution waypoints={len(utterance.execution_waypoints)}")
+                        self.current_utterance.add_window(window)
+                        self.logger.debug(f"Utterance {utterance_id} window {window.window_index} added: total windows={len(self.current_utterance.windows)}, total execution waypoints={len(self.current_utterance.execution_waypoints)}")
                     
                     # Update window indices for next generation
-                    prev_window_end = utterance.next_window_end_sample
-                    utterance.update_window_indices()
-                    self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{utterance.next_window_start_sample}-{utterance.next_window_end_sample}] (step={utterance.next_window_start_sample - (prev_window_end - (utterance.next_window_end_sample - utterance.next_window_start_sample))} samples)")
+                    prev_window_end = self.current_utterance.next_window_end_sample
+                    self.current_utterance.update_window_indices()
+                    self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{self.current_utterance.next_window_start_sample}-{self.current_utterance.next_window_end_sample}] (step={self.current_utterance.next_window_start_sample - (prev_window_end - (self.current_utterance.next_window_end_sample - self.current_utterance.next_window_start_sample))} samples)")
 
     def _generate_gesture_window_from_audio(
         self, 
