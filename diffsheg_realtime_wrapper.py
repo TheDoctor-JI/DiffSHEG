@@ -66,7 +66,7 @@ except ImportError:
     get_hubert_from_16k_speech_long = None
 
 
-DO_AUD_NORMALIZATION = False
+DO_AUD_NORMALIZATION = True
 
 
 
