@@ -69,6 +69,7 @@ import soundfile as sf
 from datetime import datetime
 import hashlib
 import gc
+import traceback
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -223,7 +224,8 @@ class Utterance:
         Clear all content of the utterance for reuse.
         This resets all data structures while keeping the object alive.
         """
-        
+
+    
         with self.waypoints_lock:
             
             if ENABLE_CLEARING_META1:
@@ -250,18 +252,10 @@ class Utterance:
                 self.audio_samples = b''
                 
                 # Clear gesture data structures
-                for window in self.windows:
-                    for wp in window.execution_waypoints:
-                        del wp.gesture_data
-                    for wp in window.context_waypoints:
-                        del wp.gesture_data
-                
-                for wp in self.execution_waypoints:
-                    del wp.gesture_data
-                self.windows = []  # Create new list instead of .clear()
-                self.execution_waypoints = []  # Create new list
+                self.windows.clear()
+                self.execution_waypoints.clear()
                 self.last_executed_waypoint_index = -1
-
+                
 
     def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
@@ -835,7 +829,8 @@ class DiffSHEGRealtimeWrapper:
                 self.current_utterance.clear()
                 
         except Exception as e:
-            self.logger.error(f'Failed to stop utterance with exception:{e}')
+            self.logger.error(f'Failed to stop utterance with exception: {type(e).__name__}: {e}')
+            self.logger.error(f'Traceback:\n{traceback.format_exc()}')
 
         finally:
             if will_lock:
