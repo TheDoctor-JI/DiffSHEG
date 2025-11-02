@@ -263,7 +263,7 @@ class DiffSHEGRealtimeWrapper:
     AUDIO_DUR_FOR_FEATURES = 5.0  # Duration in seconds for constrained audio context
     
     # Global flag for saving audio windows for debugging
-    SAVE_WINDOWS = False
+    SAVE_WINDOWS = True
 
     # Global flag for controlling whether we allow stopping utterances
     ALLOW_STOPPING_UTTR = False
@@ -321,13 +321,10 @@ class DiffSHEGRealtimeWrapper:
             self.device = device_str
             
 
-        if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR:
-            self.cleanup_timeout = (
-                cleanup_timeout if cleanup_timeout is not None
-                else gesture_config.get('cleanup_timeout', 2.0)
-            )
-        else:
-            self.cleanup_timeout = 10000
+        self.cleanup_timeout = (
+            cleanup_timeout if cleanup_timeout is not None
+            else gesture_config.get('cleanup_timeout', 2.0)
+        )
             
         # Store waypoint callback
         self.waypoint_callback = waypoint_callback
@@ -422,29 +419,36 @@ class DiffSHEGRealtimeWrapper:
     def _warmup_cuda_context(self):
         """
         Warm up CUDA context with dummy inference to eliminate cold-start overhead.
-        
-        This runs a full forward pass through the model to:
-        1. Initialize CUDA kernels
-        2. Allocate GPU memory pools
-        3. Compile any JIT operations
-        4. Eliminate first-run latency
         """
         try:
             with torch.no_grad():
-                # Create dummy inputs matching expected shapes
+                # Warm up main model
                 dummy_audio = torch.randn(1, self.window_size, 128, device=self.device)
                 dummy_pid = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-                
-                # One-hot encode speaker ID
                 dummy_pid_onehot = self.model.one_hot(dummy_pid, self.opt.speaker_dim)
-                
-                # Create add_cond dict with HuBERT features if enabled
-                # NOTE: The key must be 'pretrain_aud_feat' to match the actual generation pipeline
                 dummy_add_cond = {}
-                if self.use_hubert:
-                    dummy_add_cond['pretrain_aud_feat'] = torch.randn(1, self.window_size, 1024, device=self.device)
                 
-                # Create empty inpainting dict
+                if self.use_hubert:
+                    # CRITICAL: Warm up HuBERT model
+                    self.logger.debug("Warming up HuBERT model...")
+                    dummy_audio_samples = torch.randn(1, 16000, device=self.device)  # 1 second of audio
+                    dummy_hubert_feat = get_hubert_from_16k_speech_long(
+                        self.hubert_model,
+                        self.wav2vec2_processor,
+                        dummy_audio_samples,
+                        device=self.device,
+                        return_on_cpu=False
+                    )
+                    # Interpolate to match window size
+                    dummy_hubert_feat = F.interpolate(
+                        dummy_hubert_feat.swapaxes(-1,-2).unsqueeze(0),
+                        size=self.window_size,
+                        mode='linear',
+                        align_corners=True
+                    ).swapaxes(-1,-2)
+                    dummy_add_cond['pretrain_aud_feat'] = dummy_hubert_feat
+                    self.logger.debug(f"HuBERT warm-up complete, output shape: {dummy_hubert_feat.shape}")
+                
                 dummy_inpaint_dict = {}
                 
                 # Run inference
@@ -591,7 +595,7 @@ class DiffSHEGRealtimeWrapper:
         """
         Reset all state-related variables.
         
-        This clears the current utterance and cancellation history.
+        This clears the current utterance and stopped history.
         Useful for starting fresh or cleaning up after a session ends.
         """
         with self.utterance_lock:
@@ -600,7 +604,7 @@ class DiffSHEGRealtimeWrapper:
             self.stopped_utterances.clear()
         
         if old_utterance_id is not None:
-            self.logger.info(f"Context reset: cleared utterance {old_utterance_id} and cancellation history")
+            self.logger.info(f"Context reset: cleared utterance {old_utterance_id} and stopped history")
     
     '''
     Utterance lifecycle methods
@@ -622,7 +626,7 @@ class DiffSHEGRealtimeWrapper:
 
         # Reject chunks for stopped/timed-out utterances
         if utterance_id in self.stopped_utterances:
-            # Silently ignore - this is expected for late-arriving chunks after cancellation
+            # Silently ignore - this is expected for late-arriving chunks after stopping
             return
         
         curren_time = time.time()
@@ -688,7 +692,7 @@ class DiffSHEGRealtimeWrapper:
                 # Then, simply discard everything - generation is faster than realtime
                 # so we can regenerate from scratch for the next utterance
                 total_samples = self.current_utterance.get_total_samples()
-                self.logger.debug(f"Cancel utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
+                self.logger.debug(f"Stop utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
                 self.current_utterance = None
 
         except Exception as e:
@@ -764,7 +768,7 @@ class DiffSHEGRealtimeWrapper:
                     if self.waypoint_callback is not None:
                         self.waypoint_callback(waypoint)
             
-            if should_cleanup:
+            if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR and should_cleanup:
                 self.stop_current_utterance()
             
             # Sleep for the remaining time to maintain 10ms interval
