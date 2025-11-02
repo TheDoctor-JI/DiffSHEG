@@ -694,6 +694,7 @@ class DiffSHEGRealtimeWrapper:
                 # so we can regenerate from scratch for the next utterance
                 total_samples = self.current_utterance.get_total_samples()
                 self.logger.debug(f"Stop utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
+                del self.current_utterance
                 self.current_utterance = None
 
         except Exception as e:
