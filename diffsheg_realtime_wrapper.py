@@ -763,10 +763,9 @@ class DiffSHEGRealtimeWrapper:
                 ## Stop the old utterance if it exists
                 self.stop_current_utterance(will_lock=False)
                 
-                if not DiffSHEGRealtimeWrapper.DEBUG_SKIP_STOPPING_LOGIC:
-                    # Update utterance ID for the new utterance (object is already cleared by stop_current_utterance)
-                    self.current_utterance.utterance_id = utterance_id
-                    self.logger.info(f"Utterance object reused with new id={utterance_id}")
+                # Update utterance ID for the new utterance (object is already cleared by stop_current_utterance)
+                self.current_utterance.utterance_id = utterance_id
+                self.logger.info(f"Utterance object reused with new id={utterance_id}")
             
             
             # Update last chunk received time
@@ -803,7 +802,7 @@ class DiffSHEGRealtimeWrapper:
         try:
             if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR:
                 # Add to stopped set to reject any late-arriving chunks
-                if (not DiffSHEGRealtimeWrapper.DEBUG_SKIP_STOPPING_LOGIC) and self.current_utterance is not None:
+                if (not DiffSHEGRealtimeWrapper.DEBUG_SKIP_STOPPING_LOGIC) and self.current_utterance.utterance_id != -1:
                     self.stopped_utterances.add(self.current_utterance.utterance_id)
                     
                     # Clear the utterance content but keep the object alive
