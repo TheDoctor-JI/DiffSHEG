@@ -84,7 +84,7 @@ except ImportError:
 
 ENABLE_CLEARING_CONTENT= True
 ENABLE_CLEARING_META1 = True
-ENAGLE_CLEARING_META2 = False
+ENAGLE_CLEARING_META2 = True
 
 @dataclass
 class GestureWaypoint:
@@ -121,6 +121,7 @@ class Utterance:
     """Tracks an ongoing or completed utterance with audio stored as concatenated samples."""
     
     PLACE_HOLDER_ID = -1
+    PLACE_HOLDER_TIMESTAMP = -1
 
     def __init__(
         self, 
@@ -131,8 +132,8 @@ class Utterance:
         window_step: int
     ):
         self.utterance_id = utterance_id
-        self.start_time: Optional[float] = None
-        self.last_chunk_received_time: float = None # Track when last chunk arrived
+        self.start_time: Optional[float] = Utterance.PLACE_HOLDER_TIMESTAMP
+        self.last_chunk_received_time: float = Utterance.PLACE_HOLDER_TIMESTAMP # Track when last chunk arrived
         
         # Audio storage: concatenated samples instead of chunks
         self.sample_rate = sample_rate
@@ -239,8 +240,10 @@ class Utterance:
             if ENAGLE_CLEARING_META2:
 
                 # Clear timing information
-                self.start_time = None
-                self.last_chunk_received_time = None
+                # Note: Setting to None can trigger GC, but we've disabled GC
+                # during critical CUDA operations to prevent interference
+                self.start_time = Utterance.PLACE_HOLDER_TIMESTAMP
+                self.last_chunk_received_time = Utterance.PLACE_HOLDER_TIMESTAMP
 
             if ENABLE_CLEARING_CONTENT:
                 # Clear audio data
@@ -259,8 +262,6 @@ class Utterance:
                 self.execution_waypoints = []  # Create new list
                 self.last_executed_waypoint_index = -1
 
-                # CRITICAL: Force immediate GPU cleanup
-                gc.collect()
 
     def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
@@ -796,7 +797,7 @@ class DiffSHEGRealtimeWrapper:
             self.current_utterance.last_chunk_received_time = curren_time
             
             # Automatically start playback when first chunk arrives, we log the timestamp here
-            if chunk_index == 0 and self.current_utterance.start_time is None:
+            if chunk_index == 0 and self.current_utterance.start_time == Utterance.PLACE_HOLDER_TIMESTAMP:
                 self.current_utterance.start_time = curren_time
                 self.logger.info(f"Utterance {utterance_id} playback started at chunk 0")
             
@@ -883,7 +884,7 @@ class DiffSHEGRealtimeWrapper:
                     continue
                 
                 # Skip if playback hasn't started yet (no chunk 0 received)
-                if self.current_utterance.start_time is None:
+                if self.current_utterance.start_time == Utterance.PLACE_HOLDER_TIMESTAMP:
                     continue
                 
                 # Calculate current playback position (time relative to utterance start)
@@ -946,7 +947,7 @@ class DiffSHEGRealtimeWrapper:
             
             # Wait for audio to start arriving
             with self.utterance_lock:
-                if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID or self.current_utterance.start_time is None:
+                if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID or self.current_utterance.start_time == Utterance.PLACE_HOLDER_TIMESTAMP:
                     continue
             
             # Monitor for audio completion
@@ -959,7 +960,7 @@ class DiffSHEGRealtimeWrapper:
                         break
                     
                     # Check if we've stopped receiving chunks
-                    if self.current_utterance.last_chunk_received_time is not None:
+                    if self.current_utterance.last_chunk_received_time == Utterance.PLACE_HOLDER_TIMESTAMP:
                         time_since_last_chunk = time.time() - self.current_utterance.last_chunk_received_time
                         if time_since_last_chunk >= audio_complete_threshold:
                             # Audio is complete!
@@ -1443,21 +1444,32 @@ class DiffSHEGRealtimeWrapper:
         
         # ===== STEP 1-4: Extract or use precomputed features =====
         self.logger.debug('Extracting audio features for the window.')
-        if precomputed_mel is not None:
-            # Non-streaming mode: Use precomputed features
-            audio_emb = precomputed_mel  # [1, T, 128]
-            add_cond = {}
-            if precomputed_hubert is not None:
-                add_cond["pretrain_aud_feat"] = precomputed_hubert  # [1, T, 1024]
-        else:
-            # Streaming mode: Extract features from truncated audio using helper
-            audio_emb, hubert_feat = self._extract_audio_features(audio_bytes_truncated, sample_rate)
-            if audio_emb.shape[1] == 0:
-                return []
-            
-            add_cond = {}
-            if hubert_feat is not None:
-                add_cond["pretrain_aud_feat"] = hubert_feat
+        
+        # Disable GC during feature extraction to prevent interference with CUDA operations
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        
+        try:
+            if precomputed_mel is not None:
+                # Non-streaming mode: Use precomputed features
+                audio_emb = precomputed_mel  # [1, T, 128]
+                add_cond = {}
+                if precomputed_hubert is not None:
+                    add_cond["pretrain_aud_feat"] = precomputed_hubert  # [1, T, 1024]
+            else:
+                # Streaming mode: Extract features from truncated audio using helper
+                audio_emb, hubert_feat = self._extract_audio_features(audio_bytes_truncated, sample_rate)
+                if audio_emb.shape[1] == 0:
+                    return []
+                
+                add_cond = {}
+                if hubert_feat is not None:
+                    add_cond["pretrain_aud_feat"] = hubert_feat
+        finally:
+            # Re-enable GC if it was enabled before
+            if gc_was_enabled:
+                gc.enable()
         
         # ===== STEP 5: Window the features to get current window portion =====
         window_start_frame = int(round(window_start_sample / sample_rate * gesture_fps))
@@ -1518,16 +1530,29 @@ class DiffSHEGRealtimeWrapper:
         
         # ===== STEP 8: Generate using official trainer method =====
         self.logger.debug('Starting generation for the window.')
-        with torch.no_grad():
+        
+        # Disable GC during CUDA operations to prevent memory allocation stalls
+        # This is critical when ENAGLE_CLEARING_META2=True as GC can interfere
+        # with CuDNN kernel selection and GPU memory allocation
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        
+        try:
+            with torch.no_grad():
 
-            ## Ensure previous operations are complete without blocking
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(self.device)  # Clear any pending ops
-            
+                ## Ensure previous operations are complete without blocking
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)  # Clear any pending ops
+                
 
-            outputs = self.model.generate_batch(
-                audio_window, p_id, C, add_cond, inpaint_dict
-            )
+                outputs = self.model.generate_batch(
+                    audio_window, p_id, C, add_cond, inpaint_dict
+                )
+        finally:
+            # Re-enable GC if it was enabled before
+            if gc_was_enabled:
+                gc.enable()
         
 
         self.logger.debug('Finalizing generated outputs for the window.')
