@@ -703,7 +703,6 @@ def main():
         opt=opt,
         audio_sr=16000,  # From config
         device=opt.device,
-        cleanup_timeout=2.0,
         waypoint_callback=waypoint_handler
     )
     
@@ -883,10 +882,10 @@ def main():
         if EMULATE_MULTI_UTTR:
             # Need to wait for multiple utterances
             num_utterances = len(utterance_boundaries)
-            wait_time = audio_duration + wrapper.cleanup_timeout * num_utterances + 1.0
+            wait_time = audio_duration + 2 * num_utterances + 1.0
             print(f"Waiting {wait_time:.1f}s (extended for {num_utterances} utterances)...")
         else:
-            wait_time = audio_duration + wrapper.cleanup_timeout + 1.0
+            wait_time = audio_duration + 2 + 1.0
             print(f"Waiting {wait_time:.1f}s...")
         time.sleep(wait_time)
     

@@ -407,7 +407,6 @@ class DiffSHEGRealtimeWrapper:
         config: dict = None,
         audio_sr: int = None,
         device: str = None,
-        cleanup_timeout: float = None,
         waypoint_callback = None
     ):
         """
@@ -420,8 +419,6 @@ class DiffSHEGRealtimeWrapper:
                    for default values. Individual parameters override config values.
             audio_sr: Audio sample rate. If None, reads from config or uses 16000.
             device: Computing device. If None, reads from config or uses opt.device.
-            cleanup_timeout: Seconds to wait after playback ends before auto-cleanup.
-                           If None, reads from config or uses 2.0.
             waypoint_callback: Optional callback function to execute waypoints.
                              Should accept a GestureWaypoint object as parameter.
                              If None, waypoints are generated but not executed.
@@ -450,11 +447,6 @@ class DiffSHEGRealtimeWrapper:
         else:
             self.device = device_str
             
-
-        self.cleanup_timeout = (
-            cleanup_timeout if cleanup_timeout is not None
-            else gesture_config.get('cleanup_timeout', 2.0)
-        )
             
         # Store waypoint callback
         self.waypoint_callback = waypoint_callback
@@ -829,7 +821,7 @@ class DiffSHEGRealtimeWrapper:
         
         Args:
             utterance_id: Unique identifier for the utterance (msg_idx in your system)
-            chunk_index: Position of this chunk within the utterance (starts from 0)
+            chunk_index: Position of this chunk within the utterance (starts from 0, note that this idx is the global index and won't reset with the end of an utterance)
             audio_data: Raw audio data (list of integers)
             duration: Optional duration of the chunk in seconds (not used internally, kept for API compatibility)
         """
@@ -854,23 +846,21 @@ class DiffSHEGRealtimeWrapper:
                 
                 # Update utterance ID for the new utterance
                 self.current_utterance.utterance_id = utterance_id
-                self.logger.info(f"Utterance object changed to new id={utterance_id}")
             
+                ## By the time the chunk arrive, the playback of this utterance would have started (roughly)
+                self.current_utterance.start_time = curren_time
+                self.logger.info(f"Utterance object changed to new id={utterance_id}, playback should have started.")
             
             # Update last chunk received time
             self.current_utterance.last_chunk_received_time = curren_time
             
-            # Automatically start playback when first chunk arrives, we log the timestamp here
-            if chunk_index == 0 and self.current_utterance.start_time == Utterance.PLACE_HOLDER_TIMESTAMP:
-                self.current_utterance.start_time = curren_time
-                self.logger.info(f"Utterance {utterance_id} playback started at chunk 0")
-            
+
             # Add audio samples to utterance
             audio_samples_before = self.current_utterance.get_total_samples()
             self.current_utterance.add_audio_samples(audio_data)
             audio_samples_after = self.current_utterance.get_total_samples()
             
-            # # Avoid too frequent logging
+            # ## Avoid too frequent logging
             # self.logger.debug(f"Utterance {utterance_id} chunk {chunk_index}: added {audio_samples_after - audio_samples_before} samples (total: {audio_samples_after})")
     
     def stop_current_utterance(self, will_lock: bool):
@@ -929,15 +919,12 @@ class DiffSHEGRealtimeWrapper:
         
         Playback lifecycle:
         - Starts automatically when first chunk (index 0) arrives
-        - Auto-cleanup after playback ends (default 2 seconds after last audio)
         """
         interval_duration = 0.01  # 10ms target interval
         
         while self.running:
             iteration_start_time = time.time()
-            
-            should_cleanup = False
-            
+                        
             with self.utterance_lock:
                 
                 # Skip if no valid utterance (placeholder ID)
@@ -956,12 +943,6 @@ class DiffSHEGRealtimeWrapper:
                 total_audio_duration = total_samples / self.current_utterance.sample_rate
                 
 
-                # Auto-cleanup: if playback has passed all audio AND no new chunks for cleanup_timeout
-                if elapsed_time > total_audio_duration:
-                    time_since_last_chunk = iteration_start_time - self.current_utterance.last_chunk_received_time
-                    if time_since_last_chunk > self.cleanup_timeout:
-                        should_cleanup = True
-                
                 # Check for waypoint to execute in the next 10ms interval
                 waypoint = self.current_utterance.get_waypoint_for_interval(
                     current_time=elapsed_time,
@@ -974,9 +955,7 @@ class DiffSHEGRealtimeWrapper:
                     if self.waypoint_callback is not None:
                         self.waypoint_callback(waypoint)
             
-            if should_cleanup:
-                self.stop_current_utterance(will_lock=True)
-            
+
             # Sleep for the remaining time to maintain 10ms interval
             elapsed = time.time() - iteration_start_time
             sleep_time = max(0, interval_duration - elapsed)
