@@ -260,10 +260,13 @@ class DiffSHEGRealtimeWrapper:
     
     # Global flags for constrained feature extraction
     USE_CONSTRAINED_FEATURES = True
-    AUDIO_DUR_FOR_FEATURES = 10.0  # Duration in seconds for constrained audio context
+    AUDIO_DUR_FOR_FEATURES = 5.0  # Duration in seconds for constrained audio context
     
     # Global flag for saving audio windows for debugging
     SAVE_WINDOWS = False
+
+    # Global flag for controlling whether we allow stopping utterances
+    ALLOW_STOPPING_UTTR = False
     
 
     
@@ -317,11 +320,15 @@ class DiffSHEGRealtimeWrapper:
         else:
             self.device = device_str
             
-        self.cleanup_timeout = (
-            cleanup_timeout if cleanup_timeout is not None
-            else gesture_config.get('cleanup_timeout', 2.0)
-        )
-        
+
+        if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR:
+            self.cleanup_timeout = (
+                cleanup_timeout if cleanup_timeout is not None
+                else gesture_config.get('cleanup_timeout', 2.0)
+            )
+        else:
+            self.cleanup_timeout = 10000
+            
         # Store waypoint callback
         self.waypoint_callback = waypoint_callback
         
@@ -368,8 +375,8 @@ class DiffSHEGRealtimeWrapper:
         self.current_utterance: Optional[Utterance] = None
         self.utterance_lock = threading.Lock()
         
-        # Track cancelled/timed-out utterances to reject late-arriving chunks
-        self.cancelled_utterances: set = set()  # Set of utterance_ids that have been cancelled or timed out
+        # Track stopped/timed-out utterances to reject late-arriving chunks
+        self.stopped_utterances: set = set()  # Set of utterance_ids that have been stopped or timed out
         
         # Threading
         self.running = False
@@ -590,7 +597,7 @@ class DiffSHEGRealtimeWrapper:
         with self.utterance_lock:
             old_utterance_id = self.current_utterance.utterance_id if self.current_utterance else None
             self.current_utterance = None
-            self.cancelled_utterances.clear()
+            self.stopped_utterances.clear()
         
         if old_utterance_id is not None:
             self.logger.info(f"Context reset: cleared utterance {old_utterance_id} and cancellation history")
@@ -613,27 +620,25 @@ class DiffSHEGRealtimeWrapper:
             duration: Optional duration of the chunk in seconds (not used internally, kept for API compatibility)
         """
 
-        # Reject chunks for cancelled/timed-out utterances
-        if utterance_id in self.cancelled_utterances:
+        # Reject chunks for stopped/timed-out utterances
+        if utterance_id in self.stopped_utterances:
             # Silently ignore - this is expected for late-arriving chunks after cancellation
             return
         
         curren_time = time.time()
 
         with self.utterance_lock:
-            # Double-check after acquiring lock (in case it was cancelled while we were creating the chunk)
-            if utterance_id in self.cancelled_utterances:
+            # Double-check after acquiring lock (in case it was stopped while we were creating the chunk)
+            if utterance_id in self.stopped_utterances:
                 return
             
             # If this is a new utterance, discard the old one
-            if self.current_utterance is None or self.current_utterance.utterance_id != utterance_id:
+            if self.current_utterance is None or (DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR and self.current_utterance.utterance_id != utterance_id):
                 
-                # Mark old utterance as cancelled if it exists
-                if self.current_utterance is not None:
-                    old_utterance_id = self.current_utterance.utterance_id
-                    self.cancelled_utterances.add(old_utterance_id)
-                    self.logger.info(f"Utterance {old_utterance_id} replaced by new utterance {utterance_id}")
+                ## Stop the old utterance if it exists
+                self.stop_current_utterance(will_lock=False)
                 
+                ## Create a new utterance
                 self.current_utterance = Utterance(
                     utterance_id=utterance_id,
                     sample_rate=self.audio_sr,
@@ -643,40 +648,42 @@ class DiffSHEGRealtimeWrapper:
                 )
                 self.logger.info(f"New utterance created: id={utterance_id}")
             
-            utterance = self.current_utterance
             
             # Update last chunk received time
-            utterance.last_chunk_received_time = curren_time
+            self.current_utterance.last_chunk_received_time = curren_time
             
             # Automatically start playback when first chunk arrives, we log the timestamp here
-            if chunk_index == 0 and utterance.start_time is None:
-                utterance.start_time = curren_time
+            if chunk_index == 0 and self.current_utterance.start_time is None:
+                self.current_utterance.start_time = curren_time
                 self.logger.info(f"Utterance {utterance_id} playback started at chunk 0")
             
             # Add audio samples to utterance
-            audio_samples_before = utterance.get_total_samples()
-            utterance.add_audio_samples(audio_data)
-            audio_samples_after = utterance.get_total_samples()
+            audio_samples_before = self.current_utterance.get_total_samples()
+            self.current_utterance.add_audio_samples(audio_data)
+            audio_samples_after = self.current_utterance.get_total_samples()
             
             # # Avoid too frequent logging
             # self.logger.debug(f"Utterance {utterance_id} chunk {chunk_index}: added {audio_samples_after - audio_samples_before} samples (total: {audio_samples_after})")
     
-    def cancel_utterance(self):
+    def stop_current_utterance(self, will_lock = True):
         """
         Cancel the ongoing utterance and discard its audio chunks and generated gestures.
         
         Since gesture generation is faster than realtime, it's safe to simply
-        discard the current utterance and all its waypoints when cancelled.
+        discard the current utterance and all its waypoints when stopped.
         The system will start fresh with the next utterance.
         
         This also prevents late-arriving chunks for this utterance from being
-        processed by tracking cancelled utterance IDs in a set.
+        processed by tracking stopped utterance IDs in a set.
         
         """
-        with self.utterance_lock:
-            # Add to cancelled set to reject any late-arriving chunks
+        if will_lock:
+            self.utterance_lock.acquire()
+
+        try:
+            # Add to stopped set to reject any late-arriving chunks
             if self.current_utterance is not None:
-                self.cancelled_utterances.add(self.current_utterance.utterance_id)
+                self.stopped_utterances.add(self.current_utterance.utterance_id)
                 
                 # Then, simply discard everything - generation is faster than realtime
                 # so we can regenerate from scratch for the next utterance
@@ -684,24 +691,13 @@ class DiffSHEGRealtimeWrapper:
                 self.logger.debug(f"Cancel utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
                 self.current_utterance = None
 
-    def _cleanup_current_utterance(self):
-        """
-        Internal cleanup method called automatically by playback managing thread.
-        Cleans up current utterance data after playback naturally ends.
-        Also marks the utterance as cancelled to reject any late-arriving chunks.
-        """
-        with self.utterance_lock:
-            if self.current_utterance is not None:
-                utterance_id = self.current_utterance.utterance_id
-                total_samples = self.current_utterance.get_total_samples()
-                duration_sec = total_samples / self.current_utterance.sample_rate
-                
-                # Mark as cancelled to reject late chunks
-                self.cancelled_utterances.add(utterance_id)
-    
-                self.current_utterance = None
-                
-                self.logger.debug(f"Utterance {utterance_id} auto-cleanup: playback ended naturally (duration={duration_sec:.2f}s)")
+        except Exception as e:
+            self.logger.error(f'Failed to stop uttterance with exception:{e}')
+
+        finally:
+            if will_lock:
+                self.utterance_lock.release()
+
 
 
     '''
@@ -769,7 +765,7 @@ class DiffSHEGRealtimeWrapper:
                         self.waypoint_callback(waypoint)
             
             if should_cleanup:
-                self._cleanup_current_utterance()
+                self.stop_current_utterance()
             
             # Sleep for the remaining time to maintain 10ms interval
             elapsed = time.time() - iteration_start_time
@@ -1133,10 +1129,10 @@ class DiffSHEGRealtimeWrapper:
                 with self.utterance_lock:
                     utterance = self.current_utterance
                     
-                    # Check if this utterance is still current (not cancelled)
+                    # Check if this utterance is still current (not stopped)
                     if utterance is None or utterance.utterance_id != utterance_id:
-                        # Utterance was cancelled, discard window
-                        self.logger.debug(f"Utterance {utterance_id} was cancelled during generation, discarding window")
+                        # Utterance was stopped, discard window
+                        self.logger.debug(f"Utterance {utterance_id} was stopped during generation, discarding window")
                         continue
                     
                     # Add window to utterance (this also adds execution waypoints to flat list)
