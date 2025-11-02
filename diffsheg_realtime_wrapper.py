@@ -329,9 +329,7 @@ class DiffSHEGRealtimeWrapper:
     # Global flag for saving audio windows for debugging
     SAVE_WINDOWS = False
 
-    # Global flag for controlling whether we allow stopping utterances
-    ALLOW_STOPPING_UTTR = True
-    
+
     # Global flag for using pre-loaded test data for debugging
     USE_TEST_DATA_FOR_WINDOW = False
 
@@ -783,7 +781,7 @@ class DiffSHEGRealtimeWrapper:
                 return
             
             # If this is a new utterance, clear the old one and update ID
-            if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR and self.current_utterance.utterance_id != utterance_id:
+            if self.current_utterance.utterance_id != utterance_id:
                 
                 ## Stop the old utterance if it exists
                 self.stop_current_utterance(will_lock=False)
@@ -825,21 +823,17 @@ class DiffSHEGRealtimeWrapper:
             self.utterance_lock.acquire()
 
         try:
-            if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR:
-                # Add to stopped set to reject any late-arriving chunks
-                if self.current_utterance.utterance_id != Utterance.PLACE_HOLDER_ID:
-                    self.stopped_utterances.add(self.current_utterance.utterance_id)
-                    
-                    # Clear the utterance content but keep the object alive
-                    total_samples = self.current_utterance.get_total_samples()
-                    self.logger.debug(f"Stop utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
-                    
-                    # Clear all content for reuse
-                    self.current_utterance.clear()
-                    
-
-
-
+            # Add to stopped set to reject any late-arriving chunks
+            if self.current_utterance.utterance_id != Utterance.PLACE_HOLDER_ID:
+                self.stopped_utterances.add(self.current_utterance.utterance_id)
+                
+                # Clear the utterance content but keep the object alive
+                total_samples = self.current_utterance.get_total_samples()
+                self.logger.debug(f"Stop utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
+                
+                # Clear all content for reuse
+                self.current_utterance.clear()
+                
         except Exception as e:
             self.logger.error(f'Failed to stop utterance with exception:{e}')
 
@@ -913,7 +907,7 @@ class DiffSHEGRealtimeWrapper:
                     if self.waypoint_callback is not None:
                         self.waypoint_callback(waypoint)
             
-            if DiffSHEGRealtimeWrapper.ALLOW_STOPPING_UTTR and should_cleanup:
+            if should_cleanup:
                 self.stop_current_utterance(will_lock=True)
             
             # Sleep for the remaining time to maintain 10ms interval
