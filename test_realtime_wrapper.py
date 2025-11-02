@@ -15,6 +15,16 @@ TESTING MODES:
    - Uses same official generation pipeline but processes window-by-window
    - Useful for debugging without streaming complexity
 
+DEBUGGING FLAGS:
+===============
+
+EMULATE_2_UTTR (set in main()):
+   - When True: Splits test audio into 2 parts with different utterance IDs
+   - Triggers utterance clearing/reuse behavior in the wrapper
+   - Helps reproduce performance issues related to ENAGLE_CLEARING_META2
+   - Provides performance diagnostics comparing Utterance 1 vs Utterance 2
+   - Use this to verify if clear() operation causes slowdown
+
 Both modes use the EXACT same official DiffSHEG generation pipeline:
 - Official mel spectrogram extraction (librosa.feature.melspectrogram)
 - Official HuBERT feature extraction (get_hubert_from_16k_speech_long)
@@ -587,6 +597,18 @@ def official_export_logic(audio_path, trainer, opt, output_dir, pre_generated_mo
 def main():
     global waypoint_collector
     
+    # ========================================================================
+    # TEST FLAG: Emulate 2 utterances to reproduce performance issue
+    # ========================================================================
+    # When True, splits test audio into 2 parts with different utterance IDs
+    # This triggers utterance clearing/reuse behavior in the wrapper
+    # to help reproduce the ENAGLE_CLEARING_META2 slowdown bug
+    EMULATE_2_UTTR = True
+    
+    # Where to split the audio (as fraction of total duration, 0.0 to 1.0)
+    SPLIT_FRACTION = 0.5  # Split at 50% of audio duration
+    # ========================================================================
+    
     # Parse arguments (mimicking the bash script)
     parser = TrainCompOptions()
     
@@ -688,24 +710,62 @@ def main():
     print(f"Total chunks: {len(chunks)}")
     
     # Stream chunks faster than realtime
-    utterance_id = 1
     playback_speed = 5.0  # faster than realtime
     chunk_interval = chunk_duration / playback_speed
     
     print(f"\nStreaming chunks at {playback_speed}x speed (chunk every {chunk_interval:.3f}s)...")
     print(f"Estimated streaming time: {len(chunks) * chunk_interval:.2f}s")
     
+    # Determine split point for 2-utterance emulation
+    if EMULATE_2_UTTR:
+        split_chunk_idx = int(len(chunks) * SPLIT_FRACTION)
+        print(f"\n{'='*70}")
+        print(f"EMULATE_2_UTTR MODE ENABLED")
+        print(f"{'='*70}")
+        print(f"Splitting audio into 2 utterances:")
+        print(f"  - Utterance 1: chunks 0-{split_chunk_idx-1} ({split_chunk_idx} chunks)")
+        print(f"  - Utterance 2: chunks {split_chunk_idx}-{len(chunks)-1} ({len(chunks)-split_chunk_idx} chunks)")
+        print(f"This will trigger utterance clearing/reuse to reproduce the bug.")
+        print(f"{'='*70}\n")
+    else:
+        split_chunk_idx = len(chunks)  # No split, all chunks are utterance 1
+        print(f"\nEMULATE_2_UTTR MODE DISABLED - using single utterance")
+    
     start_time = time.time()
+    chunk_send_times = []  # Track time taken to send each chunk (for diagnostics)
+    
     for i, chunk in enumerate(chunks):
+        # Determine utterance ID based on EMULATE_2_UTTR flag
+        if EMULATE_2_UTTR and i >= split_chunk_idx:
+            utterance_id = 2
+            # Reset chunk index for new utterance
+            chunk_index = i - split_chunk_idx
+            
+            # Add a small delay when transitioning to simulate real utterance boundary
+            if i == split_chunk_idx:
+                print(f"\n{'='*70}")
+                print(f"SWITCHING TO UTTERANCE 2 (chunk {i})")
+                print(f"This triggers clear() which sets timing vars if ENAGLE_CLEARING_META2=True")
+                print(f"{'='*70}\n")
+                time.sleep(0.1)  # Small gap between utterances
+        else:
+            utterance_id = 1
+            chunk_index = i
+        
+        chunk_start = time.time()
         wrapper.add_audio_chunk(
             utterance_id=utterance_id,
-            chunk_index=i,
+            chunk_index=chunk_index,
             audio_data=chunk,
             duration=chunk_duration
         )
+        chunk_elapsed = time.time() - chunk_start
+        chunk_send_times.append(chunk_elapsed)
         
+        # Report progress
         if (i + 1) % 10 == 0:
-            print(f"Sent chunk {i + 1}/{len(chunks)}")
+            avg_chunk_time = np.mean(chunk_send_times[-10:]) * 1000  # Last 10 chunks in ms
+            print(f"Sent chunk {i + 1}/{len(chunks)} (uttr_id={utterance_id}, avg={avg_chunk_time:.2f}ms)")
         
         if i < len(chunks) - 1:  # Don't sleep after last chunk
             time.sleep(chunk_interval)
@@ -722,8 +782,13 @@ def main():
     else:
         print("\nWaiting for gesture generation and playback to complete...")
         # Wait for audio duration + cleanup timeout
-        wait_time = audio_duration + wrapper.cleanup_timeout + 1.0
-        print(f"Waiting {wait_time:.1f}s...")
+        if EMULATE_2_UTTR:
+            # Need to wait for both utterances
+            wait_time = audio_duration + wrapper.cleanup_timeout * 2 + 1.0
+            print(f"Waiting {wait_time:.1f}s (extended for 2 utterances)...")
+        else:
+            wait_time = audio_duration + wrapper.cleanup_timeout + 1.0
+            print(f"Waiting {wait_time:.1f}s...")
         time.sleep(wait_time)
     
     # Stop wrapper
