@@ -88,7 +88,7 @@ except ImportError:
 
 ENABLE_CLEARING_CONTENT= True
 ENABLE_CLEARING_META1 = True
-ENAGLE_CLEARING_META2 = True
+ENAGLE_CLEARING_META2 = False
 DO_AUD_NORMALIZATION = False
 
 
@@ -312,14 +312,12 @@ class Utterance:
                 self.next_window_start_sample = 0
                 self.next_window_end_sample = window_duration_samples
 
+                self.last_chunk_received_time = Utterance.PLACE_HOLDER_TIMESTAMP
+
                 
             if ENAGLE_CLEARING_META2:
-
                 # Clear timing information
-                # Note: Setting to None can trigger GC, but we've disabled GC
-                # during critical CUDA operations to prevent interference
                 self.start_time = Utterance.PLACE_HOLDER_TIMESTAMP
-                self.last_chunk_received_time = Utterance.PLACE_HOLDER_TIMESTAMP
 
             if ENABLE_CLEARING_CONTENT:
                 # Clear audio data
@@ -1529,7 +1527,6 @@ class DiffSHEGRealtimeWrapper:
         self.logger.debug('Starting generation for the window.')
         
         # Disable GC during CUDA operations to prevent memory allocation stalls
-        # This is critical when ENAGLE_CLEARING_META2=True as GC can interfere
         # with CuDNN kernel selection and GPU memory allocation
         gc_was_enabled = gc.isenabled()
         if gc_was_enabled:
