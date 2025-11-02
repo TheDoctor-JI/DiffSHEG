@@ -609,13 +609,19 @@ def main():
     EMULATE_MULTI_UTTR = True
     
     # Simulate rapid utterance cancellations (like in real usage)
-    # Format: list of (utterance_duration_fraction, utterance_id)
-    # The real log showed: 1s, 1.32s, 1s, then 2.52s (where it hung)
-    UTTERANCE_SPLITS = [
-        (0.13, 0),  # First ~1 second → utterance 0
-        (0.30, 1),  # Next ~1.3 seconds → utterance 1  
-        (0.43, 2),  # Next ~1 second → utterance 2
-        (1.00, 3),  # Remaining audio → utterance 3 (this is where hang occurs)
+    # The real log showed these durations:
+    # - Utterance 0: 16000 samples = 1.0 second
+    # - Utterance 1: 21120 samples = 1.32 seconds
+    # - Utterance 2: 16000 samples = 1.0 second
+    # - Utterance 3: 40320 samples = 2.52 seconds (where hang occurred)
+    
+    # NOTE: These will be calculated as fractions AFTER loading the test audio
+    # based on the actual audio duration. See calculation below.
+    UTTERANCE_DURATIONS = [
+        (1.0, 0),    # Utterance 0: 1.0 second
+        (1.32, 1),   # Utterance 1: 1.32 seconds  
+        (1.0, 2),    # Utterance 2: 1.0 second
+        (None, 3),   # Utterance 3: remaining audio (where hang occurs)
     ]
     # ========================================================================
     
@@ -728,21 +734,40 @@ def main():
     
     # Determine split points for multi-utterance emulation
     if EMULATE_MULTI_UTTR:
-        # Calculate chunk indices for each utterance boundary
+        # Calculate chunk indices for each utterance boundary based on durations
         utterance_boundaries = []
-        for frac, uttr_id in UTTERANCE_SPLITS:
-            chunk_idx = int(len(chunks) * frac)
-            utterance_boundaries.append((chunk_idx, uttr_id))
+        cumulative_time = 0.0
         
         print(f"\n{'='*70}")
         print(f"EMULATE_MULTI_UTTR MODE ENABLED")
         print(f"{'='*70}")
+        print(f"Test audio duration: {audio_duration:.2f}s")
         print(f"Simulating rapid utterance cancellations (like real usage):")
+        
+        for duration, uttr_id in UTTERANCE_DURATIONS:
+            if duration is None:
+                # Last utterance gets remaining audio
+                chunk_idx = len(chunks)
+                cumulative_time = audio_duration
+            else:
+                cumulative_time += duration
+                # Convert time to chunk index
+                chunk_idx = int((cumulative_time / audio_duration) * len(chunks))
+                # Ensure we don't exceed total chunks
+                chunk_idx = min(chunk_idx, len(chunks))
+            
+            utterance_boundaries.append((chunk_idx, uttr_id))
+        
+        # Print the calculated splits
         prev_idx = 0
+        prev_time = 0.0
         for chunk_idx, uttr_id in utterance_boundaries:
+            chunk_count = chunk_idx - prev_idx
             duration = (chunk_idx - prev_idx) * chunk_duration
-            print(f"  - Utterance {uttr_id}: chunks {prev_idx}-{chunk_idx-1} ({chunk_idx-prev_idx} chunks, {duration:.2f}s)")
+            print(f"  - Utterance {uttr_id}: chunks {prev_idx}-{chunk_idx-1} ({chunk_count} chunks, {duration:.2f}s)")
             prev_idx = chunk_idx
+            prev_time += duration
+        
         print(f"Based on real log: Utterances 0→1→2 cancelled quickly, then hang on 3")
         print(f"This triggers multiple rapid clear() operations before the problematic one.")
         print(f"{'='*70}\n")
