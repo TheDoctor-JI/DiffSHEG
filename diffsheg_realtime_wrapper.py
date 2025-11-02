@@ -66,9 +66,6 @@ except ImportError:
     get_hubert_from_16k_speech_long = None
 
 
-ENABLE_CLEARING_CONTENT= True
-ENABLE_CLEARING_META1 = True
-ENAGLE_CLEARING_META2 = True
 DO_AUD_NORMALIZATION = False
 
 
@@ -281,29 +278,26 @@ class Utterance:
     
         with self.waypoints_lock:
             
-            if ENABLE_CLEARING_META1:
-                self.utterance_id = Utterance.PLACE_HOLDER_ID  # Reset to placeholder ID
+            self.utterance_id = Utterance.PLACE_HOLDER_ID  # Reset to placeholder ID
 
-                # Reset window indices to start from sample 0
-                window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
+            # Reset window indices to start from sample 0
+            window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
 
 
-                self.next_window_start_sample = 0
-                self.next_window_end_sample = window_duration_samples
+            self.next_window_start_sample = 0
+            self.next_window_end_sample = window_duration_samples
 
                 
-            if ENAGLE_CLEARING_META2:
-                # Clear timing information
-                self.start_time = Utterance.PLACE_HOLDER_TIMESTAMP
+            # Clear timing information
+            self.start_time = Utterance.PLACE_HOLDER_TIMESTAMP
 
-            if ENABLE_CLEARING_CONTENT:
-                # Clear audio data
-                self.audio_samples = b''
-                
-                # Clear gesture data structures
-                self.windows.clear()
-                self.execution_waypoints.clear()
-                self.last_executed_waypoint_index = -1
+            # Clear audio data
+            self.audio_samples = b''
+            
+            # Clear gesture data structures
+            self.windows.clear()
+            self.execution_waypoints.clear()
+            self.last_executed_waypoint_index = -1
                 
 
     def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
