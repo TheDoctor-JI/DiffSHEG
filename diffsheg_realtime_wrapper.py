@@ -264,7 +264,7 @@ class DiffSHEGRealtimeWrapper:
     AUDIO_DUR_FOR_FEATURES = 5.0  # Duration in seconds for constrained audio context
     
     # Global flag for saving audio windows for debugging
-    SAVE_WINDOWS = True
+    SAVE_WINDOWS = False
 
     # Global flag for controlling whether we allow stopping utterances
     ALLOW_STOPPING_UTTR = False
