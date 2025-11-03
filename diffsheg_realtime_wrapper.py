@@ -180,7 +180,7 @@ class Utterance:
         gesture_fps: int,
         window_size: int,
         window_step: int,
-        generation_delayed_start_sec: Optional[float] = None
+        generation_delayed_start_sec: Optional[float] = 0
     ):
         self.utterance_id = utterance_id
         self.start_time: Optional[float] = Utterance.PLACE_HOLDER_TIMESTAMP
@@ -198,11 +198,8 @@ class Utterance:
         # Initialize window indices - start from sample 0 or delayed start
         window_duration_samples = int((window_size / gesture_fps) * sample_rate)
 
-        if generation_delayed_start_sec is None:
-            self.next_window_start_sample: int = 0
-        else:
-            generation_delayed_start_sample_cnt = int(generation_delayed_start_sec * sample_rate)
-            self.next_window_start_sample: int = generation_delayed_start_sample_cnt
+        generation_delayed_start_sample_cnt = int(generation_delayed_start_sec * sample_rate)
+        self.next_window_start_sample: int = generation_delayed_start_sample_cnt
 
         self.next_window_end_sample: int = self.next_window_start_sample + window_duration_samples
 
