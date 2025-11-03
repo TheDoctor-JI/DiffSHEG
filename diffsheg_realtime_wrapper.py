@@ -174,32 +174,38 @@ class Utterance:
     PLACE_HOLDER_TIMESTAMP = -1
 
     def __init__(
-        self, 
+        self,
         utterance_id: int,
         sample_rate: int,
         gesture_fps: int,
         window_size: int,
-        window_step: int
+        window_step: int,
+        generation_delayed_start_sec: Optional[float] = None
     ):
         self.utterance_id = utterance_id
         self.start_time: Optional[float] = Utterance.PLACE_HOLDER_TIMESTAMP
-        
+
         # Audio storage: concatenated samples instead of chunks
         self.sample_rate = sample_rate
         self.audio_samples: bytes = b''  # Concatenated raw audio samples (s16le encoded)
         self.bytes_per_sample = 2  # s16le encoding uses 2 bytes per sample
-        
+
         # Generation state: tracks which audio window to generate next (in terms of sample indices)
         self.gesture_fps = gesture_fps
         self.window_size = window_size  # Number of frames per window
         self.window_step = window_step  # Number of non-overlapping frames per window
-        
-        # Initialize window indices - start from sample 0 (beginning of utterance)
+
+        # Initialize window indices - start from sample 0 or delayed start
         window_duration_samples = int((window_size / gesture_fps) * sample_rate)
-        
-        self.next_window_start_sample: int = 0
-        self.next_window_end_sample: int = window_duration_samples
-        
+
+        if generation_delayed_start_sec is None:
+            self.next_window_start_sample: int = 0
+        else:
+            generation_delayed_start_sample_cnt = int(generation_delayed_start_sec * sample_rate)
+            self.next_window_start_sample: int = generation_delayed_start_sample_cnt
+
+        self.next_window_end_sample: int = self.next_window_start_sample + window_duration_samples
+
         # Gesture data structures
         self.windows: List[WaypointWindow] = []  # All generated windows
         self.execution_waypoints: List[GestureWaypoint] = []  # Flat list of waypoints for execution (only is_for_execution=True)
@@ -464,13 +470,17 @@ class DiffSHEGRealtimeWrapper:
         # DiffSHEG uses 15 FPS for BEAT dataset
         self.gesture_fps = 15
         
+        # Load delayed start seconds from config
+        delayed_start_sec = self.config.get('co_speech_gestures', {}).get('delayed_start_sec', None)
+
         # Current utterance tracking (created once and reused)
         self.current_utterance: Utterance = Utterance(
             utterance_id=Utterance.PLACE_HOLDER_ID,  # Placeholder ID, will be updated when first chunk arrives
             sample_rate=self.audio_sr,
             gesture_fps=self.gesture_fps,
             window_size=self.window_size,
-            window_step=self.window_step
+            window_step=self.window_step,
+            generation_delayed_start_sec=delayed_start_sec
         )
         self.utterance_lock = threading.Lock()
         self.logger.info("Persistent utterance object created (will be reused)")
