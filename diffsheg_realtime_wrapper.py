@@ -406,6 +406,11 @@ class DiffSHEGRealtimeWrapper:
             self.device = torch.device(device_str)
         else:
             self.device = device_str
+
+        # Speaker ID configuration (for BEAT: 0-29)
+        self.speaker_id = gesture_config.get('speaker_id', 0)
+        if not isinstance(self.speaker_id, int) or not (self.speaker_id in [2,4,6,8]):
+            raise ValueError(f"Invalid speaker_id {self.speaker_id}. Must be integer in range 0-29 for BEAT dataset.")
             
             
         # Store waypoint callback
@@ -1263,10 +1268,10 @@ class DiffSHEGRealtimeWrapper:
         C = self.opt.net_dim_pose
         motions = torch.zeros((B, T, C), device=self.device)
         
-        # Person ID (use ID 2, index 1 - same as official test_custom_aud)
-        p_id = torch.ones((1, 1), device=self.device) * 1  # pid 2 - 1 = 1
+        # Person ID (use configurable speaker_id)
+        p_id = torch.ones((1, 1), device=self.device) * (self.speaker_id - 1)
         p_id = self.model.one_hot(p_id, self.opt.speaker_dim).to(self.device)
-        
+            
         # ===== STEP 7: Prepare inpainting dict for overlap (EXACT official code) =====
         inpaint_dict = {}
         if self.overlap_len > 0:
