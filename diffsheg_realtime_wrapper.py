@@ -437,7 +437,8 @@ class Utterance:
         # Initialize window indices - start from sample 0 or delayed start
         window_duration_samples = int((window_size / gesture_fps) * sample_rate)
 
-        generation_delayed_start_sample_cnt = int(generation_delayed_start_sec * sample_rate)
+        self.generation_delayed_start_sec = generation_delayed_start_sec
+        generation_delayed_start_sample_cnt = int(self.generation_delayed_start_sec * sample_rate)
         self.next_window_start_sample: int = generation_delayed_start_sample_cnt
 
         self.next_window_end_sample: int = self.next_window_start_sample + window_duration_samples
@@ -508,6 +509,45 @@ class Utterance:
             # Add all execution waypoints to the flat list for playback
             self.execution_waypoints.extend(window.execution_waypoints)
     
+    def initialize_new_utterance(self, utterance_id: int, start_time: float, 
+                                 prefill_neutral_window: Optional[WaypointWindow] = None):
+        """
+        Initialize a new utterance with ID and start time.
+        
+        If generation_delayed_start_sec > 0, pre-fills the windows with a neutral position window
+        to provide playable content during the delayed start period.
+        
+        Args:
+            utterance_id: Unique identifier for this utterance
+            start_time: Wall clock time when playback starts (seconds)
+            prefill_neutral_window: Optional pre-constructed neutral window to use for delayed start.
+                                   This method will set proper timestamps based on the gesture FPS.
+        """
+        with self.waypoints_lock:
+            self.utterance_id = utterance_id
+            self.start_time = start_time
+            
+            # Pre-fill with neutral window if delayed start is configured
+            if self.generation_delayed_start_sec > 0 and prefill_neutral_window is not None:
+                # Create a deep copy to avoid modifying the template
+                from copy import deepcopy
+                neutral_window_copy = deepcopy(prefill_neutral_window)
+                
+                # Set proper timestamps for all waypoints
+                # Frame indices start at 0 for the prefilled window, timestamps are relative to utterance start
+                for i, waypoint in enumerate(neutral_window_copy.execution_waypoints):
+                    waypoint.waypoint_index = i
+                    waypoint.timestamp = i / self.gesture_fps
+                
+                # Set timestamps for context waypoints
+                for i, waypoint in enumerate(neutral_window_copy.context_waypoints):
+                    waypoint.waypoint_index = self.window_step + i
+                    waypoint.timestamp = (self.window_step + i) / self.gesture_fps
+                
+                # Add the prefilled window to windows and execution waypoints
+                self.windows.append(neutral_window_copy)
+                self.execution_waypoints.extend(neutral_window_copy.execution_waypoints)
+    
     def clear(self):
         """
         Clear all content of the utterance for reuse.
@@ -519,12 +559,12 @@ class Utterance:
             
             self.utterance_id = Utterance.PLACE_HOLDER_ID  # Reset to placeholder ID
 
-            # Reset window indices to start from sample 0
+            # Reset window indices to start from sample 0 or delayed start
             window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
+            generation_delayed_start_sample_cnt = int(self.generation_delayed_start_sec * self.sample_rate)
 
-
-            self.next_window_start_sample = 0
-            self.next_window_end_sample = window_duration_samples
+            self.next_window_start_sample = generation_delayed_start_sample_cnt
+            self.next_window_end_sample = self.next_window_start_sample + window_duration_samples
 
                 
             # Clear timing information
@@ -538,7 +578,6 @@ class Utterance:
             self.execution_waypoints.clear()
             self.last_executed_waypoint_index = -1
                 
-
     def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
         Find the waypoint that should be executed in the next interval.
@@ -771,6 +810,15 @@ class DiffSHEGRealtimeWrapper:
         # Store last generated motion (for avoiding regeneration during export)
         self.last_generated_motion = None
         
+        # Track the last executed waypoint for monitoring and debugging
+        self.last_executed_waypoint: Optional[GestureWaypoint] = None
+        
+        # Create prefilled neutral window for delayed start (if configured)
+        self.prefill_neutral_window: Optional[WaypointWindow] = None
+        if delayed_start_sec is not None and delayed_start_sec > 0:
+            self.prefill_neutral_window = self._create_neutral_window()
+            self.logger.info(f"Created neutral prefill window for delayed start ({delayed_start_sec}s)")
+        
         self.logger.info(f"DiffSHEG parameters: window_size={self.window_size}, overlap={self.overlap_len}, step={self.window_step}, fps={self.gesture_fps}")
 
         # Warm up CUDA context with dummy inference
@@ -796,7 +844,53 @@ class DiffSHEGRealtimeWrapper:
                 f"Mel frame rate {mel_frame_rate:.3f} does not match gesture FPS {self.gesture_fps}; check configuration."
             )
 
+    def _create_neutral_window(self) -> WaypointWindow:
+        """
+        Create a prefilled window with neutral positions for all gestures.
+        
+        This is used when generation_delayed_start_sec > 0 to provide initial playable content
+        during the delayed start period. All waypoints use the neutral position defined in
+        self.neutral_position (which includes masked joint customizations).
+        
+        Returns:
+            WaypointWindow with window_step execution waypoints + overlap_len context waypoints,
+            all filled with neutral positions. Timestamps are NOT set here; they will be set
+            in initialize_new_utterance when start_time is known.
+        """
+        execution_waypoints = []
+        context_waypoints = []
+        
+        # Create execution waypoints (window_step frames) with neutral positions
+        for i in range(self.window_step):
+            waypoint = GestureWaypoint(
+                waypoint_index=i,  # Temporary, will be updated in initialize_new_utterance
+                timestamp=0.0,     # Temporary, will be updated in initialize_new_utterance
+                gesture_data=self.neutral_position.copy(),
+                is_for_execution=True
+            )
+            execution_waypoints.append(waypoint)
+        
+        # Create context waypoints (overlap_len frames) with neutral positions
+        for i in range(self.overlap_len):
+            waypoint = GestureWaypoint(
+                waypoint_index=self.window_step + i,  # Temporary, will be updated in initialize_new_utterance
+                timestamp=0.0,                        # Temporary, will be updated in initialize_new_utterance
+                gesture_data=self.neutral_position.copy(),
+                is_for_execution=False
+            )
+            context_waypoints.append(waypoint)
+        
+        # Create window (window_index will be 0 for the prefill)
+        window = WaypointWindow(
+            window_index=0,
+            execution_waypoints=execution_waypoints,
+            context_waypoints=context_waypoints
+        )
+        
+        return window
+
     def _warmup_cuda_context(self):
+
         """
         Warm up CUDA context with dummy inference to eliminate cold-start overhead.
         """
@@ -1040,6 +1134,7 @@ class DiffSHEGRealtimeWrapper:
         with self.utterance_lock:
             self.current_utterance.clear()
             self.stopped_utterances.clear()
+            self.last_executed_waypoint = None
 
     '''
     Utterance lifecycle methods
@@ -1077,11 +1172,12 @@ class DiffSHEGRealtimeWrapper:
                 ## Stop the old utterance if it exists
                 self.stop_current_utterance(will_lock=False)
                 
-                # Update utterance ID for the new utterance
-                self.current_utterance.utterance_id = utterance_id
-            
-                ## By the time the chunk arrive, the playback of this utterance would have started (roughly)
-                self.current_utterance.start_time = curren_time
+                ## Initialize the new utterance with ID and start time
+                self.current_utterance.initialize_new_utterance(
+                    utterance_id=utterance_id,
+                    start_time=curren_time,
+                    prefill_neutral_window=self.prefill_neutral_window
+                )
                 self.logger.info(f"Utterance object changed to new id={utterance_id}, playback should have started.")
                         
             # Add audio samples to utterance
@@ -1180,6 +1276,8 @@ class DiffSHEGRealtimeWrapper:
                 if waypoint is not None:
                     # Execute waypoint gesture
                     self.logger.debug(f"Utterance {self.current_utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
+                    # Store the last executed waypoint for monitoring and debugging
+                    self.last_executed_waypoint = waypoint
                     # Call the waypoint callback if provided
                     # Note: Joint mask is already applied during waypoint generation for consistency
                     if self.waypoint_callback is not None:
