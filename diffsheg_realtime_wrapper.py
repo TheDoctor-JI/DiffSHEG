@@ -278,27 +278,36 @@ def build_joint_mask_indices(joint_names: List[str]) -> List[int]:
 
 def build_neutral_position_array(
     joint_mask_names: List[str],
-    custom_neutral_positions: Dict[str, List[float]] = None
+    custom_neutral_positions: Dict[str, List[float]] = None,
+    net_dim_pose: int = 192,
+    split_pos: int = 141
 ) -> np.ndarray:
     """
-    Build a 141-dimensional neutral position array for gestures.
+    Build a neutral position array for gestures covering both body and face.
+    
+    For BEAT dataset:
+    - net_dim_pose = 192 (default): 141 gesture + 51 expression
+    - split_pos = 141: divides gesture (0:141) from expression (141:192)
     
     Args:
-        joint_mask_names: List of joint names in the mask (from config)
+        joint_mask_names: List of joint names in the mask (from config). Only applies to gesture portion.
         custom_neutral_positions: Optional dict mapping joint names to [x, y, z] neutral angles in degrees.
                                   If a joint is in the mask but not in custom_neutral_positions, defaults to [0, 0, 0].
+        net_dim_pose: Total output dimension from model (default 192 for BEAT: 141 gesture + 51 expression)
+        split_pos: Split position between gesture and expression (default 141 for BEAT)
     
     Returns:
-        np.ndarray of shape (141,) with neutral positions. Masked joints get their custom/default values,
-        all other joints are set to 0.
+        np.ndarray of shape (net_dim_pose,) with neutral positions.
+        - Gesture portion (0:split_pos): Masked joints get their custom/default values, unmasked get 0
+        - Expression portion (split_pos:net_dim_pose): All dimensions set to 0
     
     Raises:
         ValueError: If a joint in custom_neutral_positions is not in the joint mask
     """
     custom_neutral_positions = custom_neutral_positions or {}
     
-    # Initialize all dimensions to 0
-    neutral_array = np.zeros(141, dtype=np.float32)
+    # Initialize all dimensions to 0 (covers both gesture and expression)
+    neutral_array = np.zeros(net_dim_pose, dtype=np.float32)
     
     # Validate that all custom positions are for joints in the mask
     for joint_name in custom_neutral_positions.keys():
@@ -308,10 +317,16 @@ def build_neutral_position_array(
                 f"Masked joints: {', '.join(joint_mask_names)}"
             )
     
-    # Set neutral positions for masked joints
+    # Set neutral positions for masked joints in the gesture portion only
     for joint_name in joint_mask_names:
         joint_idx = BEAT_GESTURE_JOINT_ORDER.index(joint_name)
         dimension_start = joint_idx * 3
+        
+        # Ensure we're within gesture bounds
+        if dimension_start + 3 > split_pos:
+            raise ValueError(
+                f"Joint '{joint_name}' extends beyond gesture split position {split_pos}"
+            )
         
         # Use custom position if provided, otherwise default to [0, 0, 0]
         if joint_name in custom_neutral_positions:
@@ -326,40 +341,68 @@ def build_neutral_position_array(
             # Default to [0, 0, 0] for masked joints without custom position
             neutral_array[dimension_start:dimension_start + 3] = [0, 0, 0]
     
+    # Expression portion (split_pos:net_dim_pose) remains 0 (already initialized)
+    
     return neutral_array
 
 
 def apply_joint_mask_to_waypoint(
     waypoint: GestureWaypoint,
     mask_indices: List[int],
-    neutral_position: Optional[np.ndarray] = None
+    neutral_position: Optional[np.ndarray] = None,
+    split_pos: int = 141
 ) -> GestureWaypoint:
     """
     Apply a joint mask to a waypoint, zeroing out all non-masked joints.
     
+    Works with full 192-dimensional gesture data (141 gesture + 51 expression):
+    - Only masks the gesture portion (dims 0:split_pos)
+    - Preserves the expression portion (dims split_pos:192) unchanged
+    
     Args:
-        waypoint: The original gesture waypoint with 141 dimensions
-        mask_indices: List of dimension indices to preserve (from build_joint_mask_indices)
-        neutral_position: Optional 141-dimensional array specifying neutral positions for all joints.
+        waypoint: The original gesture waypoint with net_dim_pose dimensions (typically 192)
+        mask_indices: List of dimension indices to preserve in gesture portion (from build_joint_mask_indices)
+        neutral_position: Optional net_dim_pose-dimensional array specifying neutral positions for all joints.
                          For masked joints, uses the corresponding value from this array.
                          For non-masked joints, uses 0 (or values from neutral_position if provided).
+        split_pos: Position dividing gesture (0:split_pos) from expression (split_pos:end). Default 141.
     
     Returns:
-        A new GestureWaypoint with masked gesture data (non-masked joints set to neutral/0)
+        A new GestureWaypoint with masked gesture data (non-masked gesture joints set to neutral/0,
+        expression portion unchanged)
     """
-    if not mask_indices or len(mask_indices) == 141:
+    if not mask_indices or len(mask_indices) == split_pos:
         # No masking needed
         return waypoint
     
-    # Start with neutral position if provided, otherwise all zeros
-    if neutral_position is not None:
-        masked_gesture = neutral_position.copy()
-    else:
-        masked_gesture = np.zeros(141, dtype=np.float32)
+    gesture_dim = waypoint.gesture_data.shape[0]
     
-    # # Copy only the masked dimensions from the original gesture
-    # for mask_idx in mask_indices:
-    #     masked_gesture[mask_idx] = waypoint.gesture_data[mask_idx]
+    # Start with copy of original waypoint data
+    masked_gesture = waypoint.gesture_data.copy()
+    
+    # Extract gesture and expression portions
+    gesture_portion = masked_gesture[:split_pos]
+    expression_portion = masked_gesture[split_pos:] if gesture_dim > split_pos else np.array([])
+    
+    # Apply neutral position to non-masked dimensions in gesture portion only
+    if neutral_position is not None:
+        # Use neutral position for all non-masked gesture dimensions
+        masked_gesture_portion = neutral_position[:split_pos].copy()
+        # # Copy masked dimensions from original
+        # for mask_idx in mask_indices:
+        #     if mask_idx < split_pos:
+        #         masked_gesture_portion[mask_idx] = gesture_portion[mask_idx]
+    else:
+        # No neutral position provided: zero out non-masked dimensions
+        masked_gesture_portion = np.zeros(split_pos, dtype=np.float32)
+        # Copy masked dimensions from original
+        for mask_idx in mask_indices:
+            if mask_idx < split_pos:
+                masked_gesture_portion[mask_idx] = gesture_portion[mask_idx]
+    
+    # Reconstruct full gesture with masked gesture + unchanged expression
+    masked_gesture[:split_pos] = masked_gesture_portion
+    # Expression portion remains unchanged from original
     
     # Create and return new waypoint with masked data
     return GestureWaypoint(
@@ -630,6 +673,10 @@ class DiffSHEGRealtimeWrapper:
         # Store waypoint callback
         self.waypoint_callback = waypoint_callback
         
+        # Get model output dimensions from opt
+        self.net_dim_pose = getattr(opt, 'net_dim_pose', 192)  # Default 192 for BEAT: 141 gesture + 51 expression
+        self.split_pos = getattr(opt, 'split_pos', 141)  # Default 141: gesture/expression split position
+        
         # Load and build joint mask for gesture output
         joint_mask_names = gesture_config.get('joint_mask', [])
         try:
@@ -638,19 +685,27 @@ class DiffSHEGRealtimeWrapper:
             raise ValueError(f"Invalid joint_mask configuration: {e}")
         
         # Load and build neutral position array for masked joints
+        # Now passes net_dim_pose and split_pos to create full 192D array (gesture + expression)
         custom_neutral_positions = gesture_config.get('custom_neutral_position_for_masked_joint', {})
         try:
-            self.neutral_position = build_neutral_position_array(joint_mask_names, custom_neutral_positions)
+            self.neutral_position = build_neutral_position_array(
+                joint_mask_names, 
+                custom_neutral_positions,
+                net_dim_pose=self.net_dim_pose,
+                split_pos=self.split_pos
+            )
         except ValueError as e:
             raise ValueError(f"Invalid custom_neutral_position_for_masked_joint configuration: {e}")
         
-        if self.joint_mask_indices and len(self.joint_mask_indices) < 141:
-            self.logger.info(f"Joint mask enabled: {len(self.joint_mask_indices)}/141 dimensions will be used")
+        if self.joint_mask_indices and len(self.joint_mask_indices) < self.split_pos:
+            self.logger.info(f"Joint mask enabled: {len(self.joint_mask_indices)}/{self.split_pos} gesture dimensions will be used")
             self.logger.info(f"Masked joints: {', '.join(joint_mask_names)}")
             if custom_neutral_positions:
                 self.logger.info(f"Custom neutral positions: {custom_neutral_positions}")
         else:
-            self.logger.info("No joint mask applied - all 141 dimensions will be used")
+            self.logger.info(f"No joint mask applied - all {self.split_pos} gesture dimensions will be used")
+        
+        self.logger.info(f"Model output dimensions: {self.net_dim_pose} (gesture: {self.split_pos}, expression: {self.net_dim_pose - self.split_pos})")
 
         
         self.logger.info("DiffSHEG Realtime Wrapper initialized")
@@ -1572,11 +1627,12 @@ class DiffSHEGRealtimeWrapper:
             )
             
             # Apply joint mask right after generation for consistency
-            if self.joint_mask_indices and len(self.joint_mask_indices) < 141:
+            if self.joint_mask_indices and len(self.joint_mask_indices) < self.split_pos:
                 waypoint = apply_joint_mask_to_waypoint(
                     waypoint,
                     self.joint_mask_indices,
-                    neutral_position=self.neutral_position
+                    neutral_position=self.neutral_position,
+                    split_pos=self.split_pos
                 )
             
             execution_waypoints.append(waypoint)
@@ -1595,11 +1651,12 @@ class DiffSHEGRealtimeWrapper:
                 )
                 
                 # Apply joint mask to context waypoints as well for consistency
-                if self.joint_mask_indices and len(self.joint_mask_indices) < 141:
+                if self.joint_mask_indices and len(self.joint_mask_indices) < self.split_pos:
                     waypoint = apply_joint_mask_to_waypoint(
                         waypoint,
                         self.joint_mask_indices,
-                        neutral_position=self.neutral_position
+                        neutral_position=self.neutral_position,
+                        split_pos=self.split_pos
                     )
                 
                 context_waypoints.append(waypoint)
