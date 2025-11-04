@@ -873,12 +873,16 @@ class DiffSHEGRealtimeWrapper:
         This window linearly interpolates the masked joint angles from the last executed
         waypoint to the neutral position over the specified duration.
         
+        For consistency with normal gesture windows, this blend window includes context waypoints
+        (last overlap_len frames) set to the neutral position. This provides proper inpainting
+        context for the first real generation window when it follows this blend window.
+        
         Args:
             last_waypoint: The last executed waypoint to blend from
             blend_duration_sec: Duration of the blend in seconds
             
         Returns:
-            WaypointWindow containing the blend trajectory
+            WaypointWindow containing the blend trajectory with context waypoints set to neutral
         """
         # Calculate number of frames for the blend based on gesture FPS
         num_frames = max(1, int(blend_duration_sec * self.gesture_fps))
@@ -904,11 +908,25 @@ class DiffSHEGRealtimeWrapper:
             )
             execution_waypoints.append(waypoint)
         
-        # No context waypoints needed for blend window (this is the final window)
+        # Create context waypoints (last overlap_len frames) - set to neutral position
+        # This ensures the first real generation window can use these for smooth inpainting
+        # Since the blend already reaches neutral, context frames are just copies of neutral
+        context_waypoints = []
+        if self.overlap_len > 0:
+            for i in range(self.overlap_len):
+                # Context waypoints are at the end of the blend, so all at neutral position
+                context_waypoint = GestureWaypoint(
+                    waypoint_index=num_frames + i,
+                    timestamp=(num_frames + i) / self.gesture_fps,
+                    gesture_data=self.neutral_position.copy(),
+                    is_for_execution=False  # Context waypoints are not executed
+                )
+                context_waypoints.append(context_waypoint)
+        
         window = WaypointWindow(
             window_index=0,  # Blend window is standalone
             execution_waypoints=execution_waypoints,
-            context_waypoints=[]
+            context_waypoints=context_waypoints
         )
         
         return window
