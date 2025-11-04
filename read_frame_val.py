@@ -3,6 +3,13 @@ import sys
 import os
 import yaml
 
+'''
+Reference command:
+python read_frame_val.py     --bvh_file /home/eeyifanshen/e2e_audio_LLM/SocialTaskImplementation/embodiment_manager/DiffSHEG/results/BestFGD_e999_ddim25_lastStepInterp/pid_6/gesture/bvh/2_scott_0_3_3.bvh     --cache_name beat_4english_15_141     --normalized     --output_yaml neutral_positions.yaml
+'''
+
+
+
 # BEAT skeleton joint order - must match diffsheg_realtime_wrapper.py and test_realtime_wrapper.py
 BEAT_GESTURE_JOINT_ORDER = [
     'Spine',          # indices 0-2
@@ -55,9 +62,9 @@ BEAT_GESTURE_JOINT_ORDER = [
 ]
 
 
-def extract_denormalized_from_bvh(bvh_file_path, joint_names):
+def extract_denormalized_from_bvh(bvh_file_path, joint_names, frame_idx=0):
     """
-    Extract denormalized joint angles (in degrees) from first frame of BVH file.
+    Extract denormalized joint angles (in degrees) from specified frame of BVH file.
     
     The BVH file contains DENORMALIZED EULER ANGLES in degrees.
     These are the final output from test_realtime_wrapper.py.
@@ -65,6 +72,7 @@ def extract_denormalized_from_bvh(bvh_file_path, joint_names):
     Args:
         bvh_file_path: Path to the BVH file
         joint_names: List of joint names to extract (e.g., ['RightArm', 'RightForeArm'])
+        frame_idx: Frame index to extract from (default: 0 = first frame)
     
     Returns:
         Dictionary mapping joint_name -> [x_rot, y_rot, z_rot] in degrees
@@ -109,18 +117,27 @@ def extract_denormalized_from_bvh(bvh_file_path, joint_names):
                 joint_channels[current_joint] = (start_idx, num_channels)
                 channel_count += num_channels
     
-    # Extract first frame data
+    # Extract frame data
     frame_start_idx = None
+    num_frames = 0
     for i, line in enumerate(lines):
         if line.strip().startswith('Frames:'):
             frame_start_idx = i + 2
+            # Extract number of frames from the line before
+            frames_line = lines[i].strip()
+            num_frames = int(frames_line.split(':')[1].strip())
             break
     
     if frame_start_idx is None:
         raise ValueError("Could not find MOTION data in BVH file")
     
-    first_frame_line = lines[frame_start_idx].strip()
-    frame_values = [float(x) for x in first_frame_line.split()]
+    # Validate frame index
+    if frame_idx < 0 or frame_idx >= num_frames:
+        raise ValueError(f"Frame index {frame_idx} out of range [0, {num_frames-1}]")
+    
+    # Get the requested frame line
+    frame_line = lines[frame_start_idx + frame_idx].strip()
+    frame_values = [float(x) for x in frame_line.split()]
     
     # Extract positions for requested joints
     positions = {}
@@ -192,6 +209,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Extract neutral positions from BVH file for DiffSHEG wrapper config')
     parser.add_argument('--bvh_file', type=str, required=True, help='Path to BVH file')
+    parser.add_argument('--frame', type=int, default=0, help='Frame index to extract from (default: 0 = first frame)')
     parser.add_argument('--cache_name', type=str, default='beat_4english_15_141', 
                         help='Cache name for loading normalization statistics (default: beat_4english_15_141)')
     parser.add_argument('--output_yaml', type=str, default=None, help='Output YAML file (optional)')
@@ -205,13 +223,14 @@ if __name__ == "__main__":
     
     print("=" * 80)
     print(f"EXTRACTING NEUTRAL POSITIONS FROM BVH: {args.bvh_file}")
+    print(f"Frame index: {args.frame}")
     print(f"Cache name: {args.cache_name}")
     print(f"Normalized output: {args.normalized}")
     print("=" * 80)
     
     try:
         # Extract denormalized values from BVH
-        denorm_pos = extract_denormalized_from_bvh(args.bvh_file, all_beat_joints)
+        denorm_pos = extract_denormalized_from_bvh(args.bvh_file, all_beat_joints, frame_idx=args.frame)
         
         # Convert to normalized space if requested
         if args.normalized:

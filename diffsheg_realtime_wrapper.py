@@ -312,9 +312,8 @@ def build_neutral_position_array(
     # Validate that all custom positions are for joints in the mask
     for joint_name in custom_neutral_positions.keys():
         if joint_name not in joint_mask_names:
-            raise ValueError(
-                f"Joint '{joint_name}' in custom_neutral_positions is not in joint_mask. "
-                f"Masked joints: {', '.join(joint_mask_names)}"
+            print(
+                f"Joint '{joint_name}' in custom_neutral_positions is not in joint_mask. Will ignore it."
             )
     
     # Set neutral positions for masked joints in the gesture portion only
@@ -1625,7 +1624,6 @@ class DiffSHEGRealtimeWrapper:
                     waypoint,
                     self.joint_mask_indices,
                     split_pos=self.split_pos,
-                    custom_neural_positions_for_masked=self.neutral_position
                 )
             
             execution_waypoints.append(waypoint)
@@ -1649,7 +1647,6 @@ class DiffSHEGRealtimeWrapper:
                         waypoint,
                         self.joint_mask_indices,
                         split_pos=self.split_pos,
-                        custom_neural_positions_for_masked=self.neutral_position
                     )
                 
                 context_waypoints.append(waypoint)
