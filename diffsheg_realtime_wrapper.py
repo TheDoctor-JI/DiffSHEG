@@ -365,7 +365,8 @@ def slerp_interpolate_axis_angles(
     end_pose: np.ndarray,
     joint_mask_indices: List[int],
     num_frames: int,
-    split_pos: int = 141
+    split_pos: int = 141,
+    debug: bool = False
 ) -> List[np.ndarray]:
     """
     Perform SLERP interpolation on axis-angle representations for masked joints.
@@ -380,6 +381,7 @@ def slerp_interpolate_axis_angles(
         joint_mask_indices: List of dimension indices for masked joints (from build_joint_mask_indices)
         num_frames: Number of interpolated frames to generate
         split_pos: Position dividing gesture (0:split_pos) from expression (split_pos:end). Default 141.
+        debug: If True, print detailed debugging information for each joint
     
     Returns:
         List of interpolated pose vectors, each of shape (net_dim_pose,)
@@ -400,11 +402,23 @@ def slerp_interpolate_axis_angles(
            joint_mask_indices[i+2] == joint_mask_indices[i] + 2:
             joint_starts.append(joint_mask_indices[i])
     
+    if debug:
+        print("\n" + "="*80)
+        print("SLERP INTERPOLATION DEBUG")
+        print("="*80)
+        print(f"Number of frames to interpolate: {num_frames}")
+        print(f"Number of masked joints: {len(joint_starts)}")
+        print(f"Joint start indices: {joint_starts}")
+        print()
+    
     # Perform SLERP for each masked joint
-    for joint_start_idx in joint_starts:
+    for joint_idx, joint_start_idx in enumerate(joint_starts):
         # Ensure we're within gesture bounds
         if joint_start_idx + 3 > split_pos:
             continue
+        
+        # Get joint name for debugging
+        joint_name = BEAT_GESTURE_JOINT_ORDER[joint_start_idx // 3] if debug else None
         
         # Extract axis-angle vectors for this joint (3D)
         start_axis_angle = start_pose[joint_start_idx:joint_start_idx + 3]
@@ -415,12 +429,21 @@ def slerp_interpolate_axis_angles(
         start_angle = np.linalg.norm(start_axis_angle)
         end_angle = np.linalg.norm(end_axis_angle)
         
+        if debug:
+            print(f"Joint {joint_idx + 1}/{len(joint_starts)}: {joint_name} (indices {joint_start_idx}-{joint_start_idx+2})")
+            print(f"  Start axis-angle: [{start_axis_angle[0]:8.5f}, {start_axis_angle[1]:8.5f}, {start_axis_angle[2]:8.5f}]  (magnitude: {start_angle:.6f})")
+            print(f"  End axis-angle:   [{end_axis_angle[0]:8.5f}, {end_axis_angle[1]:8.5f}, {end_axis_angle[2]:8.5f}]  (magnitude: {end_angle:.6f})")
+        
         # If both are near-zero, just use linear interpolation (both are identity)
         if start_angle < 1e-8 and end_angle < 1e-8:
+            if debug:
+                print(f"  -> Both near-zero, using linear interpolation")
             for frame_idx in range(num_frames):
                 alpha = (frame_idx + 1) / num_frames
                 interpolated_frames[frame_idx][joint_start_idx:joint_start_idx + 3] = \
                     start_axis_angle * (1 - alpha) + end_axis_angle * alpha
+            if debug:
+                print()
             continue
         
         # Convert to Rotation objects for SLERP
@@ -428,13 +451,39 @@ def slerp_interpolate_axis_angles(
         try:
             start_rot = Rotation.from_rotvec(start_axis_angle)
             end_rot = Rotation.from_rotvec(end_axis_angle)
+            
+            # CRITICAL FIX: Ensure shortest path by checking quaternion dot product
+            # Quaternions q and -q represent the same rotation, but SLERP needs them on the same hemisphere
+            start_quat = start_rot.as_quat()  # [x, y, z, w]
+            end_quat = end_rot.as_quat()
+            
+            # If dot product is negative, quaternions are on opposite hemispheres
+            # Negate end quaternion to ensure shortest path
+            quat_dot = np.dot(start_quat, end_quat)
+            if quat_dot < 0:
+                end_quat = -end_quat
+                end_rot = Rotation.from_quat(end_quat)
+            
+            if debug:
+                print(f"  Start quaternion: [{start_quat[0]:7.4f}, {start_quat[1]:7.4f}, {start_quat[2]:7.4f}, {start_quat[3]:7.4f}]")
+                print(f"  End quaternion:   [{end_quat[0]:7.4f}, {end_quat[1]:7.4f}, {end_quat[2]:7.4f}, {end_quat[3]:7.4f}]")
+                print(f"  Quaternion dot product: {quat_dot:.4f} {'(negated end quat)' if quat_dot < 0 else ''}")
+                
+                # Check the angular distance between rotations
+                # Use absolute value of dot product for distance calculation
+                angular_distance_rad = 2 * np.arccos(np.clip(np.abs(quat_dot), -1.0, 1.0))
+                angular_distance_deg = np.degrees(angular_distance_rad)
+                print(f"  Angular distance: {angular_distance_deg:.2f} degrees")
+                
         except Exception as e:
             # Fallback to linear interpolation if rotation conversion fails
-            print(f"Warning: SLERP conversion failed for joint at idx {joint_start_idx}: {e}")
+            print(f"Warning: SLERP conversion failed for joint {joint_name} at idx {joint_start_idx}: {e}")
             for frame_idx in range(num_frames):
                 alpha = (frame_idx + 1) / num_frames
                 interpolated_frames[frame_idx][joint_start_idx:joint_start_idx + 3] = \
                     start_axis_angle * (1 - alpha) + end_axis_angle * alpha
+            if debug:
+                print()
             continue
         
         # Create SLERP interpolator
@@ -452,55 +501,28 @@ def slerp_interpolate_axis_angles(
         # Convert all interpolated rotations to axis-angles at once
         interp_axis_angles = interp_rots.as_rotvec()
         
-        # Store all frames for this joint
+        # Get the actual end axis-angle after potential quaternion negation
+        # This ensures consistency with the SLERP path
+        end_axis_angle_corrected = end_rot.as_rotvec()
+        
+        if debug:
+            print(f"  Interpolated trajectory ({num_frames} frames):")
+            for frame_idx in range(num_frames):
+                aa = interp_axis_angles[frame_idx]
+                magnitude = np.linalg.norm(aa)
+                t = (frame_idx + 1) / num_frames
+                print(f"    Frame {frame_idx+1:2d} (t={t:.3f}): [{aa[0]:8.5f}, {aa[1]:8.5f}, {aa[2]:8.5f}]  (mag: {magnitude:.6f})")
+            print()
+        
+        # Store all frames for this joint - use SLERP results for all frames
         for frame_idx in range(num_frames):
-            # For the very last frame (t=1.0), use the exact target to avoid numerical issues
-            if frame_idx == num_frames - 1:
-                interpolated_frames[frame_idx][joint_start_idx:joint_start_idx + 3] = end_axis_angle.copy()
-            else:
-                interpolated_frames[frame_idx][joint_start_idx:joint_start_idx + 3] = interp_axis_angles[frame_idx]
+            interpolated_frames[frame_idx][joint_start_idx:joint_start_idx + 3] = interp_axis_angles[frame_idx]
     
-    # # Debug: Compare final frame against target end_pose for masked joints
-    # if num_frames > 0:
-    #     final_frame = interpolated_frames[-1]
-    #     print("\n=== SLERP Interpolation Debug ===")
-    #     print(f"Number of frames generated: {num_frames}")
-    #     print(f"Number of masked joints: {len(joint_starts)}")
-        
-    #     max_diff = 0.0
-    #     max_diff_joint_idx = -1
-        
-    #     for joint_start_idx in joint_starts:
-    #         if joint_start_idx + 3 > split_pos:
-    #             continue
-            
-    #         final_axis_angle = final_frame[joint_start_idx:joint_start_idx + 3]
-    #         target_axis_angle = end_pose[joint_start_idx:joint_start_idx + 3]
-    #         diff = np.linalg.norm(final_axis_angle - target_axis_angle)
-            
-    #         if diff > max_diff:
-    #             max_diff = diff
-    #             max_diff_joint_idx = joint_start_idx
-            
-    #         if diff > 1e-6:  # Only print joints with non-trivial differences
-    #             joint_idx = joint_start_idx // 3
-    #             joint_name = BEAT_GESTURE_JOINT_ORDER[joint_idx] if joint_idx < len(BEAT_GESTURE_JOINT_ORDER) else f"Joint_{joint_idx}"
-    #             print(f"\n{joint_name} (dim {joint_start_idx}-{joint_start_idx+2}):")
-    #             print(f"  Final:  {final_axis_angle}")
-    #             print(f"  Target: {target_axis_angle}")
-    #             print(f"  Diff:   {diff:.6f}")
-        
-    #     print(f"\nMax difference: {max_diff:.6f} at joint dim {max_diff_joint_idx}")
-        
-    #     # Check unmasked joints (should all be at end_pose)
-    #     unmasked_dims = [i for i in range(split_pos) if i not in joint_mask_indices]
-    #     if unmasked_dims:
-    #         sample_unmasked = unmasked_dims[:min(3, len(unmasked_dims))]  # Check first 3 unmasked dims
-    #         print(f"\nSample unmasked dimensions (should match end_pose):")
-    #         for dim in sample_unmasked:
-    #             print(f"  Dim {dim}: final={final_frame[dim]:.6f}, target={end_pose[dim]:.6f}, diff={abs(final_frame[dim] - end_pose[dim]):.6f}")
-        
-    #     print("=================================\n")
+    if debug:
+        print("="*80)
+        print("SLERP INTERPOLATION COMPLETE")
+        print("="*80)
+        print()
     
     return interpolated_frames
 
@@ -1058,12 +1080,14 @@ class DiffSHEGRealtimeWrapper:
         end_pose = self.neutral_position.copy()
         
         # Perform SLERP interpolation on masked joints
+        # Enable debug mode to see interpolation trajectory
         interpolated_poses = slerp_interpolate_axis_angles(
             start_pose=start_pose,
             end_pose=end_pose,
             joint_mask_indices=self.joint_mask_indices,
             num_frames=num_frames,
-            split_pos=self.split_pos
+            split_pos=self.split_pos,
+            debug=True  # Enable debugging output
         )
         
         # Create waypoints from interpolated poses
@@ -1150,12 +1174,14 @@ class DiffSHEGRealtimeWrapper:
         end_pose = self.neutral_position.copy()
         
         # Perform SLERP interpolation from start_pose to neutral
+        # Enable debug mode to see interpolation trajectory
         interpolated_poses = slerp_interpolate_axis_angles(
             start_pose=start_pose,
             end_pose=end_pose,
             joint_mask_indices=self.joint_mask_indices,
             num_frames=num_blend_frames,
-            split_pos=self.split_pos
+            split_pos=self.split_pos,
+            debug=True  # Enable debugging output
         )
         
         # Add SLERP-interpolated blend frames
@@ -1741,7 +1767,17 @@ class DiffSHEGRealtimeWrapper:
                                 # Call the waypoint callback if provided
                                 if self.waypoint_callback is not None:
                                     self.waypoint_callback(waypoint)
-                            
+                                    # self.waypoint_callback(
+                                    #     GestureWaypoint(
+                                    #                 waypoint_index=0,
+                                    #                 timestamp=0.0,
+                                    #                 gesture_data=self.neutral_position.copy(),
+                                    #                 is_for_execution=False
+                                    #             )
+                                    # )
+
+
+
             elif current_state == PlaybackState.BLENDING_TO_NEUTRAL:
                 # Handle blend window playback
                 with self.playback_state_lock:
@@ -1773,7 +1809,15 @@ class DiffSHEGRealtimeWrapper:
                             # Call callback
                             if self.waypoint_callback is not None:
                                 self.waypoint_callback(waypoint_to_execute)
-                        
+                                # self.waypoint_callback(
+                                #     GestureWaypoint(
+                                #                 waypoint_index=0,
+                                #                 timestamp=0.0,
+                                #                 gesture_data=self.neutral_position.copy(),
+                                #                 is_for_execution=False
+                                #             )
+                                # )
+
                         # Check if blend is complete
                         if self.blend_last_executed_waypoint_index >= len(self.blend_window.execution_waypoints) - 1:
                             self.logger.info("Blend to neutral completed, transitioning to IDLE")
