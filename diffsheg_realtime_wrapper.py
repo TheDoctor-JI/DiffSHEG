@@ -1466,11 +1466,33 @@ class DiffSHEGRealtimeWrapper:
                 # Check if we have enough samples for the next window
                 available_samples = self.current_utterance.get_total_samples()
                 
-                if available_samples < self.current_utterance.next_window_end_sample:
-                    # Not enough samples yet, wait for more
-                    continue
+                # Variables to track if this is a tail generation with zero-padding
+                is_tail_generation = False
+                tail_audio_samples = 0  # How many genuine audio samples in tail
                 
-                # We have enough samples, prepare to generate
+                if available_samples < self.current_utterance.next_window_end_sample:
+                    # Not enough samples for a full window
+                    # Check if utterance is complete (total_duration has been set)
+                    if self.current_utterance.total_duration is None:
+                        # Utterance not complete yet, more audio may arrive - keep waiting
+                        continue
+                    else:
+                        # Utterance is complete, but has insufficient tail audio
+                        # Generate gestures for the tail with zero-padding
+                        if available_samples <= self.current_utterance.next_window_start_sample:
+                            # No new audio samples in this window, skip it
+                            continue
+                        
+                        is_tail_generation = True
+                        tail_audio_samples = available_samples - self.current_utterance.next_window_start_sample
+                        self.logger.info(
+                            f"Utterance {self.current_utterance.utterance_id} tail generation: "
+                            f"available_samples={available_samples}, "
+                            f"window_start={self.current_utterance.next_window_start_sample}, "
+                            f"tail_samples={tail_audio_samples}"
+                        )
+                
+                # We have enough samples (or this is tail generation), prepare to generate
                 should_generate = True
                 utterance_id = self.current_utterance.utterance_id
                 window_start_sample = self.current_utterance.next_window_start_sample
@@ -1485,12 +1507,22 @@ class DiffSHEGRealtimeWrapper:
                     # Take audio from [window_end - constrained_samples, window_end]
                     # But ensure we don't go negative
                     audio_start_sample = max(0, window_end_sample - constrained_samples)
-                    audio_snapshot_full = self.current_utterance.get_audio_window(audio_start_sample, window_end_sample)
+                    
+                    if is_tail_generation:
+                        # For tail generation, get available audio and zero-pad
+                        audio_snapshot_full = self.current_utterance.get_audio_window(audio_start_sample, available_samples)
+                        # Zero-pad to expected length
+                        expected_bytes = (window_end_sample - audio_start_sample) * self.current_utterance.bytes_per_sample
+                        padding_needed = expected_bytes - len(audio_snapshot_full)
+                        if padding_needed > 0:
+                            audio_snapshot_full += b'\x00' * padding_needed
+                    else:
+                        audio_snapshot_full = self.current_utterance.get_audio_window(audio_start_sample, window_end_sample)
                     
                     window_duration = (window_end_sample - window_start_sample) / sample_rate
                     constrained_duration = (window_end_sample - audio_start_sample) / sample_rate
                     self.logger.debug(
-                        f"Utterance {utterance_id} generation triggered (CONSTRAINED): "
+                        f"Utterance {utterance_id} generation triggered (CONSTRAINED{' - TAIL' if is_tail_generation else ''}): "
                         f"window [{window_start_sample}-{window_end_sample}] ({window_duration:.3f}s), "
                         f"audio_context [{audio_start_sample}-{window_end_sample}] ({constrained_duration:.3f}s), "
                         f"available_samples={available_samples}"
@@ -1500,11 +1532,21 @@ class DiffSHEGRealtimeWrapper:
                     # This is needed because mel/HuBERT features must be computed over full context
                     # Following official code pattern: compute features for entire audio, then window them
                     audio_start_sample = 0
-                    audio_snapshot_full = self.current_utterance.get_audio_window(0, window_end_sample)
+                    
+                    if is_tail_generation:
+                        # For tail generation, get available audio and zero-pad
+                        audio_snapshot_full = self.current_utterance.get_audio_window(0, available_samples)
+                        # Zero-pad to expected length
+                        expected_bytes = window_end_sample * self.current_utterance.bytes_per_sample
+                        padding_needed = expected_bytes - len(audio_snapshot_full)
+                        if padding_needed > 0:
+                            audio_snapshot_full += b'\x00' * padding_needed
+                    else:
+                        audio_snapshot_full = self.current_utterance.get_audio_window(0, window_end_sample)
                     
                     window_duration = (window_end_sample - window_start_sample) / sample_rate
                     self.logger.debug(
-                        f"Utterance {utterance_id} generation triggered: "
+                        f"Utterance {utterance_id} generation triggered{' (TAIL)' if is_tail_generation else ''}: "
                         f"window [{window_start_sample}-{window_end_sample}] ({window_duration:.3f}s), "
                         f"available_samples={available_samples}, full_context_samples={window_end_sample}"
                     )
@@ -1533,6 +1575,17 @@ class DiffSHEGRealtimeWrapper:
                     # Reset context start to 0 since test window always starts from beginning
                     audio_start_sample = 0
                 
+                # Calculate how many valid gesture frames correspond to genuine audio
+                max_valid_frames = None
+                if is_tail_generation:
+                    # Convert tail audio samples to gesture frames
+                    # Frames start from window_start_sample, and we have tail_audio_samples of valid audio
+                    max_valid_frames = int(tail_audio_samples / sample_rate * gesture_fps)
+                    self.logger.info(
+                        f"Utterance {utterance_id} tail generation: "
+                        f"tail_audio_samples={tail_audio_samples}, max_valid_frames={max_valid_frames}"
+                    )
+                
                 # Generate gestures for this window
                 gen_start_time = time.time()
                 window = self._generate_gesture_window_from_audio(
@@ -1543,7 +1596,8 @@ class DiffSHEGRealtimeWrapper:
                     gesture_fps,
                     overlap_context,
                     utterance_id,
-                    audio_context_start_sample=audio_start_sample  # Pass context start for proper windowing
+                    audio_context_start_sample=audio_start_sample,  # Pass context start for proper windowing
+                    max_valid_frames=max_valid_frames  # Pass max valid frames for tail filtering
                 )
                 gen_duration = time.time() - gen_start_time
                 if window:
@@ -1564,10 +1618,14 @@ class DiffSHEGRealtimeWrapper:
                         self.current_utterance.add_window(window)
                         self.logger.debug(f"Utterance {utterance_id} window {window.window_index} added: total windows={len(self.current_utterance.windows)}, total execution waypoints={len(self.current_utterance.execution_waypoints)}")
                     
-                    # Update window indices for next generation
-                    prev_window_end = self.current_utterance.next_window_end_sample
-                    self.current_utterance.update_window_indices()
-                    self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{self.current_utterance.next_window_start_sample}-{self.current_utterance.next_window_end_sample}] (step={self.current_utterance.next_window_start_sample - (prev_window_end - (self.current_utterance.next_window_end_sample - self.current_utterance.next_window_start_sample))} samples)")
+                    # Update window indices for next generation (only if not tail generation)
+                    # For tail generation, this was the last window, so no need to update indices
+                    if max_valid_frames is None:
+                        prev_window_end = self.current_utterance.next_window_end_sample
+                        self.current_utterance.update_window_indices()
+                        self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{self.current_utterance.next_window_start_sample}-{self.current_utterance.next_window_end_sample}] (step={self.current_utterance.next_window_start_sample - (prev_window_end - (self.current_utterance.next_window_end_sample - self.current_utterance.next_window_start_sample))} samples)")
+                    else:
+                        self.logger.info(f"Utterance {utterance_id} tail generation complete - no more windows to generate")
 
     def _generate_gesture_window_from_audio(
         self, 
@@ -1580,7 +1638,8 @@ class DiffSHEGRealtimeWrapper:
         utterance_id: int,
         precomputed_mel: Optional[torch.Tensor] = None,
         precomputed_hubert: Optional[torch.Tensor] = None,
-        audio_context_start_sample: int = 0
+        audio_context_start_sample: int = 0,
+        max_valid_frames: Optional[int] = None
     ) -> WaypointWindow:
         """
         Generate gestures for a single window using official DiffSHEG pipeline.
@@ -1627,6 +1686,9 @@ class DiffSHEGRealtimeWrapper:
             precomputed_hubert: Optional precomputed HuBERT features [1, T, 1024] for non-streaming mode
             audio_context_start_sample: Starting sample index of the audio context (default 0)
                                        Used to correctly window features when using constrained context
+            max_valid_frames: Optional maximum number of valid gesture frames to keep for tail generation.
+                            When set, only the first max_valid_frames execution waypoints are kept,
+                            as the remaining frames correspond to zero-padded audio.
         
         Returns:
             WaypointWindow containing execution waypoints and context waypoints
@@ -1768,8 +1830,20 @@ class DiffSHEGRealtimeWrapper:
         execution_waypoints = []
         context_waypoints = []
         
-        # Create execution waypoints (first window_step frames)
-        for i in range(self.window_step):
+        # Determine how many execution frames to create based on max_valid_frames
+        num_execution_frames = self.window_step
+        if max_valid_frames is not None:
+            # For tail generation, only keep frames corresponding to genuine audio
+            num_execution_frames = min(max_valid_frames, self.window_step)
+            if num_execution_frames < self.window_step:
+                self.logger.info(
+                    f"Utterance {utterance_id} tail generation: "
+                    f"keeping only {num_execution_frames}/{self.window_step} execution waypoints "
+                    f"(frames with genuine audio)"
+                )
+        
+        # Create execution waypoints (first num_execution_frames frames)
+        for i in range(num_execution_frames):
             frame_index = window_start_frame + i
             timestamp = frame_index / gesture_fps
             
@@ -1791,8 +1865,10 @@ class DiffSHEGRealtimeWrapper:
             
             execution_waypoints.append(waypoint)
         
-        # Create context waypoints (last overlap_len frames)
-        if self.overlap_len > 0:
+        # Create context waypoints (last overlap_len frames) - only if not tail generation
+        # For tail generation with filtered frames, we don't create context waypoints
+        # since there's no next window to use them
+        if self.overlap_len > 0 and max_valid_frames is None:
             for i in range(self.overlap_len):
                 frame_index = window_start_frame + self.window_step + i
                 timestamp = frame_index / gesture_fps
@@ -1826,6 +1902,7 @@ class DiffSHEGRealtimeWrapper:
         self.logger.debug(
             f"Utterance {utterance_id} window {window_idx}: "
             f"generated {len(execution_waypoints)} execution waypoints + {len(context_waypoints)} context waypoints"
+            + (f" (TAIL - filtered to {num_execution_frames} frames)" if max_valid_frames is not None else "")
         )
         return window
 
