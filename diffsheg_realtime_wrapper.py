@@ -567,7 +567,7 @@ class Utterance:
             self.execution_waypoints.clear()
             self.last_executed_waypoint_index = -1
                 
-    def get_waypoint_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
+    def get_waypoint_to_execute_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
         Find the waypoint that should be executed in the next interval.
         
@@ -887,7 +887,6 @@ class DiffSHEGRealtimeWrapper:
         for i, waypoint in enumerate(window.context_waypoints):
             waypoint.waypoint_index = self.window_step + i
             waypoint.timestamp = (self.window_step + i) / self.gesture_fps
-
 
         return window
 
@@ -1271,7 +1270,7 @@ class DiffSHEGRealtimeWrapper:
                 
 
                 # Check for waypoint to execute in the next 10ms interval
-                waypoint = self.current_utterance.get_waypoint_for_interval(
+                waypoint = self.current_utterance.get_waypoint_to_execute_for_interval(
                     current_time=elapsed_time,
                     interval_duration=interval_duration
                 )
