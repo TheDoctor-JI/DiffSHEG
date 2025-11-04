@@ -313,7 +313,7 @@ def build_neutral_position_array(
     for joint_name in custom_neutral_positions.keys():
         if joint_name not in joint_mask_names:
             raise ValueError(
-                f"Joint '{joint_name}' in custom_neutral_position_for_masked_joint is not in joint_mask. "
+                f"Joint '{joint_name}' in custom_neutral_positions is not in joint_mask. "
                 f"Masked joints: {', '.join(joint_mask_names)}"
             )
     
@@ -686,7 +686,7 @@ class DiffSHEGRealtimeWrapper:
         
         # Load and build neutral position array for masked joints
         # Now passes net_dim_pose and split_pos to create full 192D array (gesture + expression)
-        custom_neutral_positions = gesture_config.get('custom_neutral_position_for_masked_joint', {})
+        custom_neutral_positions = gesture_config.get('custom_neutral_positions', {})
         try:
             self.neutral_position = build_neutral_position_array(
                 joint_mask_names, 
@@ -695,7 +695,7 @@ class DiffSHEGRealtimeWrapper:
                 split_pos=self.split_pos
             )
         except ValueError as e:
-            raise ValueError(f"Invalid custom_neutral_position_for_masked_joint configuration: {e}")
+            raise ValueError(f"Invalid custom_neutral_positions configuration: {e}")
         
         if self.joint_mask_indices and len(self.joint_mask_indices) < self.split_pos:
             self.logger.info(f"Joint mask enabled: {len(self.joint_mask_indices)}/{self.split_pos} gesture dimensions will be used")
