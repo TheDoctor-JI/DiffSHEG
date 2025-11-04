@@ -357,9 +357,9 @@ def apply_joint_mask_to_waypoint(
     else:
         masked_gesture = np.zeros(141, dtype=np.float32)
     
-    # Copy only the masked dimensions from the original gesture
-    for mask_idx in mask_indices:
-        masked_gesture[mask_idx] = waypoint.gesture_data[mask_idx]
+    # # Copy only the masked dimensions from the original gesture
+    # for mask_idx in mask_indices:
+    #     masked_gesture[mask_idx] = waypoint.gesture_data[mask_idx]
     
     # Create and return new waypoint with masked data
     return GestureWaypoint(
