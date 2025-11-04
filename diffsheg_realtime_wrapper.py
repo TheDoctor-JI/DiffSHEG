@@ -567,6 +567,20 @@ class Utterance:
             self.execution_waypoints.clear()
             self.last_executed_waypoint_index = -1
                 
+    def is_active(self) -> bool:
+        """
+        Check whether this utterance is currently active.
+        
+        An utterance is considered active if:
+        - It has a valid utterance ID (not placeholder)
+        - It has a valid start time (not placeholder)
+        
+        Returns:
+            True if the utterance is active, False otherwise.
+        """
+        return (self.utterance_id != Utterance.PLACE_HOLDER_ID and 
+                self.start_time != Utterance.PLACE_HOLDER_TIMESTAMP)
+    
     def get_waypoint_to_execute_for_interval(self, current_time: float, interval_duration: float = 0.01) -> Optional[GestureWaypoint]:
         """
         Find the waypoint that should be executed in the next interval.
