@@ -166,6 +166,146 @@ class WaypointWindow:
     context_waypoints: List[GestureWaypoint]  # Waypoints for next window's inpainting (overlap_len frames)
 
 
+# BEAT skeleton joint order as defined in DiffSHEG data_tools.py
+# This defines which 47 joints are used from the full skeleton, in order
+BEAT_GESTURE_JOINT_ORDER = [
+    'Spine',          # indices 0-2
+    'Neck',           # indices 3-5
+    'Neck1',          # indices 6-8
+    
+    # Right arm
+    'RightShoulder',  # indices 9-11
+    'RightArm',       # indices 12-14
+    'RightForeArm',   # indices 15-17
+    'RightHand',      # indices 18-20
+    
+    # Right hand fingers - Middle
+    'RightHandMiddle1',  # indices 21-23
+    'RightHandMiddle2',  # indices 24-26
+    'RightHandMiddle3',  # indices 27-29
+    
+    # Right hand - Ring
+    'RightHandRing',     # indices 30-32
+    'RightHandRing1',    # indices 33-35
+    'RightHandRing2',    # indices 36-38
+    'RightHandRing3',    # indices 39-41
+    
+    # Right hand - Pinky
+    'RightHandPinky',    # indices 42-44
+    'RightHandPinky1',   # indices 45-47
+    'RightHandPinky2',   # indices 48-50
+    'RightHandPinky3',   # indices 51-53
+    
+    # Right hand - Index
+    'RightHandIndex',    # indices 54-56
+    'RightHandIndex1',   # indices 57-59
+    'RightHandIndex2',   # indices 60-62
+    'RightHandIndex3',   # indices 63-65
+    
+    # Right hand - Thumb
+    'RightHandThumb1',   # indices 66-68
+    'RightHandThumb2',   # indices 69-71
+    'RightHandThumb3',   # indices 72-74
+    
+    # Left arm
+    'LeftShoulder',      # indices 75-77
+    'LeftArm',           # indices 78-80
+    'LeftForeArm',       # indices 81-83
+    'LeftHand',          # indices 84-86
+    
+    # Left hand fingers - Middle
+    'LeftHandMiddle1',   # indices 87-89
+    'LeftHandMiddle2',   # indices 90-92
+    'LeftHandMiddle3',   # indices 93-95
+    
+    # Left hand - Ring
+    'LeftHandRing',      # indices 96-98
+    'LeftHandRing1',     # indices 99-101
+    'LeftHandRing2',     # indices 102-104
+    'LeftHandRing3',     # indices 105-107
+    
+    # Left hand - Pinky
+    'LeftHandPinky',     # indices 108-110
+    'LeftHandPinky1',    # indices 111-113
+    'LeftHandPinky2',    # indices 114-116
+    'LeftHandPinky3',    # indices 117-119
+    
+    # Left hand - Index
+    'LeftHandIndex',     # indices 120-122
+    'LeftHandIndex1',    # indices 123-125
+    'LeftHandIndex2',    # indices 126-128
+    'LeftHandIndex3',    # indices 129-131
+    
+    # Left hand - Thumb
+    'LeftHandThumb1',    # indices 132-134
+    'LeftHandThumb2',    # indices 135-137
+    'LeftHandThumb3',    # indices 138-140
+]
+
+
+def build_joint_mask_indices(joint_names: List[str]) -> List[int]:
+    """
+    Convert a list of joint names to their corresponding dimension indices in the 141-dimensional gesture data.
+    
+    Args:
+        joint_names: List of joint names from BEAT_GESTURE_JOINT_ORDER, e.g., ['Spine', 'Neck', 'RightArm']
+    
+    Returns:
+        List of dimension indices (0-140) corresponding to the requested joints.
+        Each joint contributes 3 dimensions (X, Y, Z rotations), e.g., 'Spine' -> [0, 1, 2]
+    
+    Raises:
+        ValueError: If any joint name is not found in the BEAT skeleton
+    """
+    if not joint_names:
+        return list(range(141))  # Use all dimensions if no mask specified
+    
+    mask_indices = []
+    for joint_name in joint_names:
+        if joint_name not in BEAT_GESTURE_JOINT_ORDER:
+            raise ValueError(
+                f"Joint '{joint_name}' not found in BEAT skeleton. "
+                f"Available joints: {', '.join(BEAT_GESTURE_JOINT_ORDER)}"
+            )
+        
+        joint_idx = BEAT_GESTURE_JOINT_ORDER.index(joint_name)
+        # Each joint has 3 dimensions (XYZ rotations)
+        dimension_start = joint_idx * 3
+        mask_indices.extend([dimension_start, dimension_start + 1, dimension_start + 2])
+    
+    return sorted(mask_indices)
+
+
+def apply_joint_mask_to_waypoint(waypoint: GestureWaypoint, mask_indices: List[int]) -> GestureWaypoint:
+    """
+    Apply a joint mask to a waypoint, zeroing out all non-masked joints.
+    
+    Args:
+        waypoint: The original gesture waypoint with 141 dimensions
+        mask_indices: List of dimension indices to preserve (from build_joint_mask_indices)
+    
+    Returns:
+        A new GestureWaypoint with masked gesture data (non-masked joints set to 0)
+    """
+    if not mask_indices or len(mask_indices) == 141:
+        # No masking needed
+        return waypoint
+    
+    # Create masked gesture data (all zeros initially)
+    masked_gesture = np.zeros(141, dtype=np.float32)
+    
+    # Copy only the masked dimensions from the original gesture
+    for mask_idx in mask_indices:
+        masked_gesture[mask_idx] = waypoint.gesture_data[mask_idx]
+    
+    # Create and return new waypoint with masked data
+    return GestureWaypoint(
+        waypoint_index=waypoint.waypoint_index,
+        timestamp=waypoint.timestamp,
+        gesture_data=masked_gesture,
+        is_for_execution=waypoint.is_for_execution
+    )
+
 
 class Utterance:
     """Tracks an ongoing or completed utterance with audio stored as concatenated samples."""
@@ -418,6 +558,20 @@ class DiffSHEGRealtimeWrapper:
             
         # Store waypoint callback
         self.waypoint_callback = waypoint_callback
+        
+        # Load and build joint mask for gesture output
+        joint_mask_names = gesture_config.get('joint_mask', [])
+        try:
+            self.joint_mask_indices = build_joint_mask_indices(joint_mask_names)
+        except ValueError as e:
+            raise ValueError(f"Invalid joint_mask configuration: {e}")
+        
+        if self.joint_mask_indices and len(self.joint_mask_indices) < 141:
+            self.logger.info(f"Joint mask enabled: {len(self.joint_mask_indices)}/141 dimensions will be used")
+            self.logger.info(f"Masked joints: {', '.join(joint_mask_names)}")
+        else:
+            self.logger.info("No joint mask applied - all 141 dimensions will be used")
+
         
         # Initialize logger
         self.logger = setup_logger(
@@ -909,7 +1063,12 @@ class DiffSHEGRealtimeWrapper:
                     self.logger.debug(f"Utterance {self.current_utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
                     # Call the waypoint callback if provided
                     if self.waypoint_callback is not None:
-                        self.waypoint_callback(waypoint)
+                        # Apply joint mask if configured
+                        if self.joint_mask_indices and len(self.joint_mask_indices) < 141:
+                            masked_waypoint = apply_joint_mask_to_waypoint(waypoint, self.joint_mask_indices)
+                            self.waypoint_callback(masked_waypoint)
+                        else:
+                            self.waypoint_callback(waypoint)
             
 
             # Sleep for the remaining time to maintain 10ms interval
