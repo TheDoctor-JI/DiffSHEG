@@ -53,7 +53,7 @@ import traceback
 import tempfile
 import os
 from copy import deepcopy
-from utils.PlaybackState import PlaybackState
+from PlaybackState import PlaybackState
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1482,8 +1482,8 @@ class DiffSHEGRealtimeWrapper:
                                 interval_duration=interval_duration
                             )
                             if waypoint is not None:
-                                # Execute waypoint gesture
-                                self.logger.debug(f"Utterance {self.current_utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
+                                # # Execute waypoint gesture
+                                # self.logger.debug(f"Utterance {self.current_utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
                                 # Store the last executed waypoint for monitoring and debugging
                                 self.last_executed_waypoint = waypoint
                                 # Call the waypoint callback if provided
