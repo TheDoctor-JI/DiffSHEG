@@ -73,9 +73,9 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
 
 try:
-    from utils import rotation_conversions as rot_cvt
+    import datasets.rotation_converter as rot_cvt
 except ImportError as e:
-    print(f"ERROR: Failed to import rotation_conversions from DiffSHEG utils: {e}")
+    print(f"ERROR: Failed to import rotation_converter from DiffSHEG datasets: {e}")
     print("Make sure you're running this script from the DiffSHEG directory.")
     sys.exit(1)
 
@@ -271,8 +271,9 @@ def convert_euler_to_normalized_axis_angle(denormalized_angles: dict, mean_axis:
     
     # Convert Euler (radians) → axis-angle using DiffSHEG's rotation utilities
     # This is the INVERSE of what waypoint_post_proc does
+    # Note: BEAT uses 'XYZ' convention (same as used in axis_angle_to_euler_angles)
     euler_tensor = torch.from_numpy(euler_radians_reshaped).float()
-    axis_angle_tensor = rot_cvt.euler_angles_to_axis_angle(euler_tensor)  # (47, 3)
+    axis_angle_tensor = rot_cvt.euler_angles_to_axis_angle(euler_tensor, 'XYZ')  # (47, 3)
     axis_angle = axis_angle_tensor.numpy().reshape(-1)  # (141,)
     
     # Normalize: (axis_angle - mean) / std
