@@ -169,6 +169,19 @@ class WaypointWindow:
 
 # BEAT skeleton joint order as defined in DiffSHEG data_tools.py
 # This defines which 47 joints are used from the full skeleton, in order
+# By default, model Output (wrapper) gives NORMALIZED axis-angle representation (141 dims)
+# waypoint_post_proc in co-speech gesture server:
+#   Denormalizes axis-angle: denorm_axis = normalized * std_axis + mean_axis
+#   Converts axis-angle → Euler (radians)
+#   Converts Euler (radians) → Euler (degrees)
+#   Re-normalizes with Euler stats: normalized_euler = (euler_deg - mean_euler) / std_euler
+#   Denormalizes: final = normalized_euler * std_euler + mean_euler
+# Result: DENORMALIZED Euler in DEGREES
+# Frontend: Receives DENORMALIZED Euler in DEGREES
+
+
+# BEAT skeleton joint order as defined in DiffSHEG data_tools.py
+# This defines which 47 joints are used from the full skeleton, in order
 BEAT_GESTURE_JOINT_ORDER = [
     'Spine',          # indices 0-2
     'Neck',           # indices 3-5
