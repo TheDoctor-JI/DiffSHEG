@@ -366,32 +366,62 @@ def slerp_interpolate_axis_angles(
     joint_mask_indices: List[int],
     num_frames: int,
     split_pos: int = 141,
+    axis_angle_mean: Optional[np.ndarray] = None,
+    axis_angle_std: Optional[np.ndarray] = None,
     debug: bool = False
 ) -> List[np.ndarray]:
     """
     Perform SLERP interpolation on axis-angle representations for masked joints.
+    
+    CRITICAL: This function performs SLERP in DENORMALIZED axis-angle space, then
+    renormalizes the results. This ensures proper rotation magnitudes and avoids
+    distortion from interpolating in normalized space.
     
     For proper rotation interpolation, we use Spherical Linear Interpolation (SLERP)
     on each joint's axis-angle representation, rather than naively interpolating the
     x, y, z components separately (which produces unnatural motion).
     
     Args:
-        start_pose: Starting pose vector (net_dim_pose,) in normalized axis-angle space
-        end_pose: Ending pose vector (net_dim_pose,) in normalized axis-angle space
+        start_pose: Starting pose vector (net_dim_pose,) in NORMALIZED axis-angle space
+        end_pose: Ending pose vector (net_dim_pose,) in NORMALIZED axis-angle space
         joint_mask_indices: List of dimension indices for masked joints (from build_joint_mask_indices)
         num_frames: Number of interpolated frames to generate
         split_pos: Position dividing gesture (0:split_pos) from expression (split_pos:end). Default 141.
+        axis_angle_mean: Mean for denormalization (shape: split_pos,). If None, assumes already denormalized.
+        axis_angle_std: Std for denormalization (shape: split_pos,). If None, assumes already denormalized.
         debug: If True, print detailed debugging information for each joint
     
     Returns:
-        List of interpolated pose vectors, each of shape (net_dim_pose,)
+        List of interpolated pose vectors, each of shape (net_dim_pose,) in NORMALIZED space
     """
     if not joint_mask_indices or num_frames < 1:
         return [start_pose.copy() for _ in range(num_frames)]
     
-    # Initialize output frames as copies of end_pose (so unmasked joints are at neutral/target position)
+    # Denormalize poses if normalization stats are provided
+    # CRITICAL: We MUST do SLERP in denormalized space to avoid distortion!
+    needs_normalization = (axis_angle_mean is not None and axis_angle_std is not None)
+    
+    if needs_normalization:
+        # Convert normalization stats to numpy if they're torch tensors
+        if torch.is_tensor(axis_angle_mean):
+            axis_angle_mean = axis_angle_mean.cpu().numpy()
+        if torch.is_tensor(axis_angle_std):
+            axis_angle_std = axis_angle_std.cpu().numpy()
+        
+        # Denormalize: denorm = normalized * std + mean
+        start_pose_denorm = start_pose.copy()
+        end_pose_denorm = end_pose.copy()
+        
+        start_pose_denorm[:split_pos] = start_pose[:split_pos] * axis_angle_std + axis_angle_mean
+        end_pose_denorm[:split_pos] = end_pose[:split_pos] * axis_angle_std + axis_angle_mean
+    else:
+        # Already denormalized or no stats available
+        start_pose_denorm = start_pose.copy()
+        end_pose_denorm = end_pose.copy()
+    
+    # Initialize output frames as copies of end_pose_denorm (so unmasked joints are at neutral/target position)
     # We'll then overwrite the masked joints with SLERP interpolation
-    interpolated_frames = [end_pose.copy() for _ in range(num_frames)]
+    interpolated_frames_denorm = [end_pose_denorm.copy() for _ in range(num_frames)]
     
     # Group mask indices into joints (each joint has 3 consecutive dimensions)
     # joint_mask_indices should already be sorted
@@ -406,6 +436,7 @@ def slerp_interpolate_axis_angles(
         print("\n" + "="*80)
         print("SLERP INTERPOLATION DEBUG")
         print("="*80)
+        print(f"Normalization: {'ENABLED' if needs_normalization else 'DISABLED'}")
         print(f"Number of frames to interpolate: {num_frames}")
         print(f"Number of masked joints: {len(joint_starts)}")
         print(f"Joint start indices: {joint_starts}")
@@ -420,9 +451,9 @@ def slerp_interpolate_axis_angles(
         # Get joint name for debugging
         joint_name = BEAT_GESTURE_JOINT_ORDER[joint_start_idx // 3] if debug else None
         
-        # Extract axis-angle vectors for this joint (3D)
-        start_axis_angle = start_pose[joint_start_idx:joint_start_idx + 3]
-        end_axis_angle = end_pose[joint_start_idx:joint_start_idx + 3]
+        # Extract DENORMALIZED axis-angle vectors for this joint (3D)
+        start_axis_angle = start_pose_denorm[joint_start_idx:joint_start_idx + 3]
+        end_axis_angle = end_pose_denorm[joint_start_idx:joint_start_idx + 3]
         
         # Convert axis-angles to rotation objects
         # Handle near-zero axis-angles (identity rotation)
@@ -437,10 +468,10 @@ def slerp_interpolate_axis_angles(
         # If both are near-zero, just use linear interpolation (both are identity)
         if start_angle < 1e-8 and end_angle < 1e-8:
             if debug:
-                print(f"  -> Both near-zero, using linear interpolation")
+                print(f"  -> Both near-zero, using linear interpolation (in denormalized space)")
             for frame_idx in range(num_frames):
                 alpha = (frame_idx + 1) / num_frames
-                interpolated_frames[frame_idx][joint_start_idx:joint_start_idx + 3] = \
+                interpolated_frames_denorm[frame_idx][joint_start_idx:joint_start_idx + 3] = \
                     start_axis_angle * (1 - alpha) + end_axis_angle * alpha
             if debug:
                 print()
@@ -480,7 +511,7 @@ def slerp_interpolate_axis_angles(
             print(f"Warning: SLERP conversion failed for joint {joint_name} at idx {joint_start_idx}: {e}")
             for frame_idx in range(num_frames):
                 alpha = (frame_idx + 1) / num_frames
-                interpolated_frames[frame_idx][joint_start_idx:joint_start_idx + 3] = \
+                interpolated_frames_denorm[frame_idx][joint_start_idx:joint_start_idx + 3] = \
                     start_axis_angle * (1 - alpha) + end_axis_angle * alpha
             if debug:
                 print()
@@ -514,13 +545,26 @@ def slerp_interpolate_axis_angles(
                 print(f"    Frame {frame_idx+1:2d} (t={t:.3f}): [{aa[0]:8.5f}, {aa[1]:8.5f}, {aa[2]:8.5f}]  (mag: {magnitude:.6f})")
             print()
         
-        # Store all frames for this joint - use SLERP results for all frames
+        # Store all frames for this joint - use SLERP results for all frames (in denormalized space)
         for frame_idx in range(num_frames):
-            interpolated_frames[frame_idx][joint_start_idx:joint_start_idx + 3] = interp_axis_angles[frame_idx]
+            interpolated_frames_denorm[frame_idx][joint_start_idx:joint_start_idx + 3] = interp_axis_angles[frame_idx]
+    
+    # Renormalize all frames if we denormalized earlier
+    if needs_normalization:
+        interpolated_frames = []
+        for frame_denorm in interpolated_frames_denorm:
+            frame_normalized = frame_denorm.copy()
+            # Renormalize gesture portion: normalized = (denorm - mean) / std
+            frame_normalized[:split_pos] = (frame_denorm[:split_pos] - axis_angle_mean) / axis_angle_std
+            interpolated_frames.append(frame_normalized)
+    else:
+        interpolated_frames = interpolated_frames_denorm
     
     if debug:
         print("="*80)
         print("SLERP INTERPOLATION COMPLETE")
+        if needs_normalization:
+            print("  Renormalized all frames back to normalized space")
         print("="*80)
         print()
     
@@ -926,6 +970,29 @@ class DiffSHEGRealtimeWrapper:
         
         self.logger.info(f"Model output dimensions: {self.net_dim_pose} (gesture: {self.split_pos}, expression: {self.net_dim_pose - self.split_pos})")
 
+        # Load normalization statistics for SLERP interpolation in blend windows
+        # CRITICAL: We need these to denormalize before SLERP and renormalize after
+        self.axis_angle_mean = None
+        self.axis_angle_std = None
+        try:
+            if getattr(opt, 'axis_angle', False):
+                # Construct paths to normalization stats
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                data_base_path = os.path.join(script_dir, "data", "BEAT", "beat_cache", opt.beat_cache_name, "train")
+                
+                mean_axis_path = os.path.join(data_base_path, "axis_angle_mean.npy")
+                std_axis_path = os.path.join(data_base_path, "axis_angle_std.npy")
+                
+                if os.path.exists(mean_axis_path) and os.path.exists(std_axis_path):
+                    self.axis_angle_mean = np.load(mean_axis_path).astype(np.float32)
+                    self.axis_angle_std = np.load(std_axis_path).astype(np.float32)
+                    self.logger.info(f"Loaded axis-angle normalization stats for SLERP: mean shape={self.axis_angle_mean.shape}")
+                else:
+                    self.logger.warning(f"Axis-angle normalization stats not found at {mean_axis_path}")
+                    self.logger.warning("SLERP will be performed in normalized space (may cause distortion)")
+        except Exception as e:
+            self.logger.warning(f"Failed to load axis-angle normalization stats: {e}")
+            self.logger.warning("SLERP will be performed in normalized space (may cause distortion)")
         
         self.logger.info("DiffSHEG Realtime Wrapper initialized")
         self.logger.info(f"Configuration: sample_rate={self.audio_sr}, device={self.device}")
@@ -1051,7 +1118,7 @@ class DiffSHEGRealtimeWrapper:
                 f"Mel frame rate {mel_frame_rate:.3f} does not match gesture FPS {self.gesture_fps}; check configuration."
             )
 
-    def _create_blend_to_neutral_window(self, last_waypoint: GestureWaypoint, blend_duration_sec: float) -> WaypointWindow:
+    def _create_blend_to_neutral_window(self, last_waypoint: GestureWaypoint, blend_duration_sec: float, debug: bool = False) -> WaypointWindow:
         """
         Create a window that blends from the last executed waypoint to neutral position using SLERP.
         
@@ -1081,13 +1148,16 @@ class DiffSHEGRealtimeWrapper:
         
         # Perform SLERP interpolation on masked joints
         # Enable debug mode to see interpolation trajectory
+        # Pass normalization stats to denormalize before SLERP, then renormalize after
         interpolated_poses = slerp_interpolate_axis_angles(
             start_pose=start_pose,
             end_pose=end_pose,
             joint_mask_indices=self.joint_mask_indices,
             num_frames=num_frames,
             split_pos=self.split_pos,
-            debug=True  # Enable debugging output
+            axis_angle_mean=self.axis_angle_mean,
+            axis_angle_std=self.axis_angle_std,
+            debug=debug  # Enable debugging output
         )
         
         # Create waypoints from interpolated poses
@@ -1115,6 +1185,55 @@ class DiffSHEGRealtimeWrapper:
                     is_for_execution=False  # Context waypoints are not executed
                 )
                 context_waypoints.append(context_waypoint)
+        
+        # Debug COMPARISON: Check if SLERP interpolation correctly reaches neutral position for masked joints
+        if execution_waypoints and debug:
+            last_exec_waypoint = execution_waypoints[-1]
+            self.logger.info("\n" + "="*80)
+            self.logger.info("SLERP TRAJECTORY vs NEUTRAL POSITION COMPARISON (Masked Joints Only)")
+            self.logger.info("="*80)
+            
+            # Group mask indices into joints
+            joint_starts = []
+            for i in range(0, len(self.joint_mask_indices), 3):
+                if i + 2 < len(self.joint_mask_indices) and \
+                   self.joint_mask_indices[i+1] == self.joint_mask_indices[i] + 1 and \
+                   self.joint_mask_indices[i+2] == self.joint_mask_indices[i] + 2:
+                    joint_starts.append(self.joint_mask_indices[i])
+            
+            # Compare each masked joint
+            max_diff = 0.0
+            max_diff_joint = None
+            for joint_start_idx in joint_starts:
+                if joint_start_idx + 3 > self.split_pos:
+                    continue
+                
+                joint_name = BEAT_GESTURE_JOINT_ORDER[joint_start_idx // 3]
+                
+                # Get axis-angles from last execution waypoint and neutral position
+                exec_axis_angle = last_exec_waypoint.gesture_data[joint_start_idx:joint_start_idx + 3]
+                neutral_axis_angle = self.neutral_position[joint_start_idx:joint_start_idx + 3]
+                
+                # Compute difference
+                diff = exec_axis_angle - neutral_axis_angle
+                diff_norm = np.linalg.norm(diff)
+                
+                self.logger.info(f"{joint_name:20s} | "
+                               f"Last Exec: [{exec_axis_angle[0]:8.5f}, {exec_axis_angle[1]:8.5f}, {exec_axis_angle[2]:8.5f}] | "
+                               f"Neutral: [{neutral_axis_angle[0]:8.5f}, {neutral_axis_angle[1]:8.5f}, {neutral_axis_angle[2]:8.5f}] | "
+                               f"Diff Norm: {diff_norm:8.5f}")
+                
+                if diff_norm > max_diff:
+                    max_diff = diff_norm
+                    max_diff_joint = joint_name
+            
+            self.logger.info("="*80)
+            self.logger.info(f"Maximum difference: {max_diff:.6f} (joint: {max_diff_joint})")
+            if max_diff > 0.01:
+                self.logger.warning(f"⚠️  SLERP did not reach neutral position! Max diff: {max_diff:.6f}")
+            else:
+                self.logger.info(f"✓ SLERP successfully reached neutral position (max diff: {max_diff:.6f})")
+            self.logger.info("="*80 + "\n")
         
         window = WaypointWindow(
             window_index=0,  # Blend window is standalone
@@ -1175,13 +1294,16 @@ class DiffSHEGRealtimeWrapper:
         
         # Perform SLERP interpolation from start_pose to neutral
         # Enable debug mode to see interpolation trajectory
+        # Pass normalization stats to denormalize before SLERP, then renormalize after
         interpolated_poses = slerp_interpolate_axis_angles(
             start_pose=start_pose,
             end_pose=end_pose,
             joint_mask_indices=self.joint_mask_indices,
             num_frames=num_blend_frames,
             split_pos=self.split_pos,
-            debug=True  # Enable debugging output
+            axis_angle_mean=self.axis_angle_mean,
+            axis_angle_std=self.axis_angle_std,
+            debug=False  # Enable debugging output
         )
         
         # Add SLERP-interpolated blend frames
