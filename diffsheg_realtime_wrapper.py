@@ -692,8 +692,6 @@ class DiffSHEGRealtimeWrapper:
         if self.joint_mask_indices and len(self.joint_mask_indices) < self.split_pos:
             self.logger.info(f"Joint mask enabled: {len(self.joint_mask_indices)}/{self.split_pos} gesture dimensions will be used")
             self.logger.info(f"Masked joints: {', '.join(joint_mask_names)}")
-            if custom_neutral_positions:
-                self.logger.info(f"Custom neutral positions: {custom_neutral_positions}")
         else:
             self.logger.info(f"No joint mask applied - all {self.split_pos} gesture dimensions will be used")
         
