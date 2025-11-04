@@ -226,22 +226,6 @@ def save_custom_neutral_positions(normalized_angles: dict, output_path: str):
         normalized_angles: Dict of joint_name -> [x_norm, y_norm, z_norm]
         output_path: Output YAML file path
     """
-    # Create output content
-    yaml_content = {
-        'custom_neutral_positions': {}
-    }
-    
-    # Add joints in BEAT order
-    for joint_name in BEAT_GESTURE_JOINT_ORDER:
-        if joint_name in normalized_angles:
-            # Format with 6 decimal places
-            angles = normalized_angles[joint_name]
-            yaml_content['custom_neutral_positions'][joint_name] = [
-                round(angles[0], 6),
-                round(angles[1], 6),
-                round(angles[2], 6)
-            ]
-    
     # Save to file
     with open(output_path, 'w') as f:
         # Write header comments
@@ -261,8 +245,15 @@ def save_custom_neutral_positions(normalized_angles: dict, output_path: str):
         f.write('#     # Paste the content below here\n')
         f.write('\n')
         
-        # Write YAML data
-        yaml.dump(yaml_content, f, default_flow_style=False, sort_keys=False)
+        # Write custom_neutral_positions section
+        f.write('  custom_neutral_positions:\n')
+        
+        # Add joints in BEAT order with inline list format (flow style)
+        for joint_name in BEAT_GESTURE_JOINT_ORDER:
+            if joint_name in normalized_angles:
+                # Format with 6 decimal places in flow style [x, y, z]
+                angles = normalized_angles[joint_name]
+                f.write(f'    {joint_name}: [{angles[0]:.6f}, {angles[1]:.6f}, {angles[2]:.6f}]\n')
     
     print(f"\n✓ Saved custom neutral positions to: {output_path}")
 

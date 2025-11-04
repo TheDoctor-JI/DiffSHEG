@@ -1622,6 +1622,7 @@ class DiffSHEGRealtimeWrapper:
                     waypoint,
                     self.joint_mask_indices,
                     split_pos=self.split_pos,
+                    custom_neural_positions_for_masked = self.neutral_position,
                 )
             
             execution_waypoints.append(waypoint)
@@ -1645,6 +1646,7 @@ class DiffSHEGRealtimeWrapper:
                         waypoint,
                         self.joint_mask_indices,
                         split_pos=self.split_pos,
+                        custom_neural_positions_for_masked = self.neutral_position,
                     )
                 
                 context_waypoints.append(waypoint)
