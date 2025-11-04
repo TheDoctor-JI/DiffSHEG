@@ -788,6 +788,10 @@ class DiffSHEGRealtimeWrapper:
         
         # Load delayed start seconds from config
         delayed_start_sec = self.config.get('co_speech_gestures', {}).get('delayed_start_sec', None)
+        
+        # Load duration timeout threshold from config
+        # If elapsed time exceeds prescribed duration by this threshold, stop utterance
+        self.duration_timeout_threshold = self.config.get('co_speech_gestures', {}).get('duration_timeout_threshold', 2.0)
 
         # Current utterance tracking (created once and reused)
         self.current_utterance: Utterance = Utterance(
@@ -1242,7 +1246,7 @@ class DiffSHEGRealtimeWrapper:
             if will_lock:
                 self.utterance_lock.release()
 
-    def register_utterance_end(self, utterance_duration_sec: float = 0.0, will_lock: bool = False):
+    def register_utterance_end(self, utterance_duration_sec: float = 0.0, msg_idx: int = -1, will_lock: bool = False):
         """
         Register the end of the current utterance with duration information.
         
@@ -1252,6 +1256,7 @@ class DiffSHEGRealtimeWrapper:
         
         Args:
             utterance_duration_sec: Total duration of the utterance in seconds
+            msg_idx: Message index identifying the audio message (for logging/tracing)
             will_lock: Whether to acquire the utterance lock before accessing the utterance
         """
         if will_lock:
@@ -1264,7 +1269,7 @@ class DiffSHEGRealtimeWrapper:
                 # Update the utterance duration
                 self.current_utterance.total_duration = utterance_duration_sec
                 
-                self.logger.debug(f"Register utterance {self.current_utterance.utterance_id} as completely sliced, total duration: {utterance_duration_sec:.3f}s.")
+                self.logger.info(f"Register utterance {self.current_utterance.utterance_id} (msg_idx={msg_idx}) as completely sliced, total duration: {utterance_duration_sec:.3f}s.")
                                 
         except Exception as e:
             self.logger.error(f'Failed to register utterance end with exception: {type(e).__name__}: {e}')
@@ -1318,6 +1323,16 @@ class DiffSHEGRealtimeWrapper:
                 total_samples = self.current_utterance.get_total_samples()
                 total_audio_duration = total_samples / self.current_utterance.sample_rate
                 
+                # Check if utterance has exceeded its prescribed duration by threshold amount
+                if (self.current_utterance.total_duration is not None and 
+                    self.duration_timeout_threshold > 0 and
+                    elapsed_time > self.current_utterance.total_duration + self.duration_timeout_threshold):
+                    self.logger.info(
+                        f"Utterance {self.current_utterance.utterance_id} exceeded duration by {elapsed_time - self.current_utterance.total_duration:.3f}s "
+                        f"(duration={self.current_utterance.total_duration:.3f}s, threshold={self.duration_timeout_threshold:.3f}s). Stopping."
+                    )
+                    self.stop_current_utterance(will_lock=False)
+                    continue
 
                 # Check for waypoint to execute in the next 10ms interval
                 waypoint = self.current_utterance.get_waypoint_to_execute_for_interval(
