@@ -52,6 +52,7 @@ import gc
 import traceback
 import tempfile
 import os
+from copy import deepcopy
 
 
 # Add parent directory to path to import logger
@@ -530,19 +531,7 @@ class Utterance:
             # Pre-fill with neutral window if delayed start is configured
             if self.generation_delayed_start_sec > 0 and prefill_neutral_window is not None:
                 # Create a deep copy to avoid modifying the template
-                from copy import deepcopy
                 neutral_window_copy = deepcopy(prefill_neutral_window)
-                
-                # Set proper timestamps for all waypoints
-                # Frame indices start at 0 for the prefilled window, timestamps are relative to utterance start
-                for i, waypoint in enumerate(neutral_window_copy.execution_waypoints):
-                    waypoint.waypoint_index = i
-                    waypoint.timestamp = i / self.gesture_fps
-                
-                # Set timestamps for context waypoints
-                for i, waypoint in enumerate(neutral_window_copy.context_waypoints):
-                    waypoint.waypoint_index = self.window_step + i
-                    waypoint.timestamp = (self.window_step + i) / self.gesture_fps
                 
                 # Add the prefilled window to windows and execution waypoints
                 self.windows.append(neutral_window_copy)
@@ -887,6 +876,19 @@ class DiffSHEGRealtimeWrapper:
             context_waypoints=context_waypoints
         )
         
+
+        # Set proper timestamps for all waypoints
+        # Frame indices start at 0 for the prefilled window, timestamps are relative to utterance start
+        for i, waypoint in enumerate(window.execution_waypoints):
+            waypoint.waypoint_index = i
+            waypoint.timestamp = i / self.gesture_fps
+        
+        # Set timestamps for context waypoints
+        for i, waypoint in enumerate(window.context_waypoints):
+            waypoint.waypoint_index = self.window_step + i
+            waypoint.timestamp = (self.window_step + i) / self.gesture_fps
+
+
         return window
 
     def _warmup_cuda_context(self):
