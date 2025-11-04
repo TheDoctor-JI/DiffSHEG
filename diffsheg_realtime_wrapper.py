@@ -449,6 +449,9 @@ class Utterance:
         self.execution_waypoints: List[GestureWaypoint] = []  # Flat list of waypoints for execution (only is_for_execution=True)
         self.last_executed_waypoint_index: int = -1  # Cursor for playback
         self.waypoints_lock = threading.Lock()
+        
+        # Utterance duration tracking
+        self.total_duration: Optional[float] = None  # Total duration of the utterance in seconds
     
     def add_audio_samples(self, audio_data):
         """
@@ -558,6 +561,7 @@ class Utterance:
                 
             # Clear timing information
             self.start_time = Utterance.PLACE_HOLDER_TIMESTAMP
+            self.total_duration = None  # Reset utterance duration
 
             # Clear audio data
             self.audio_samples = b''
@@ -1232,6 +1236,38 @@ class DiffSHEGRealtimeWrapper:
                 
         except Exception as e:
             self.logger.error(f'Failed to stop utterance with exception: {type(e).__name__}: {e}')
+            self.logger.error(f'Traceback:\n{traceback.format_exc()}')
+
+        finally:
+            if will_lock:
+                self.utterance_lock.release()
+
+    def register_utterance_end(self, utterance_duration_sec: float = 0.0, will_lock: bool = False):
+        """
+        Register the end of the current utterance with duration information.
+        
+        This method is called when the audio LLM completes an utterance and provides
+        the total duration. It updates the utterance duration and then clears the 
+        utterance content for reuse.
+        
+        Args:
+            utterance_duration_sec: Total duration of the utterance in seconds
+            will_lock: Whether to acquire the utterance lock before accessing the utterance
+        """
+        if will_lock:
+            self.utterance_lock.acquire()
+
+        try:
+            # Add to stopped set to reject any late-arriving chunks
+            if self.current_utterance.utterance_id != Utterance.PLACE_HOLDER_ID:
+                
+                # Update the utterance duration
+                self.current_utterance.total_duration = utterance_duration_sec
+                
+                self.logger.debug(f"Register utterance {self.current_utterance.utterance_id} as completely sliced, total duration: {utterance_duration_sec:.3f}s.")
+                                
+        except Exception as e:
+            self.logger.error(f'Failed to register utterance end with exception: {type(e).__name__}: {e}')
             self.logger.error(f'Traceback:\n{traceback.format_exc()}')
 
         finally:
