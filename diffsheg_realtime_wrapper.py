@@ -514,31 +514,29 @@ class Utterance:
             self.execution_waypoints.extend(window.execution_waypoints)
     
     def initialize_new_utterance(self, utterance_id: int, start_time: float, 
-                                 prefill_neutral_window: Optional[WaypointWindow] = None):
+                                 blend_window: Optional[WaypointWindow] = None):
         """
         Initialize a new utterance with ID and start time.
         
-        If generation_delayed_start_sec > 0, pre-fills the windows with a neutral position window
-        to provide playable content during the delayed start period.
+        If a blend_window is provided (created from delayed start duration), it will be
+        added to the utterance as the first window to provide initial playable content.
+        The blend window transitions from the last gesture to neutral position.
         
         Args:
             utterance_id: Unique identifier for this utterance
             start_time: Wall clock time when playback starts (seconds)
-            prefill_neutral_window: Optional pre-constructed neutral window to use for delayed start.
-                                   This method will set proper timestamps based on the gesture FPS.
+            blend_window: Optional pre-constructed blend-to-neutral window to use as the first window.
+                         This window is added if provided, allowing for delayed start behavior.
         """
         with self.waypoints_lock:
             self.utterance_id = utterance_id
             self.start_time = start_time
             
-            # Pre-fill with neutral window if delayed start is configured
-            if self.generation_delayed_start_sec > 0 and prefill_neutral_window is not None:
-                # Create a deep copy to avoid modifying the template
-                neutral_window_copy = deepcopy(prefill_neutral_window)
-                
-                # Add the prefilled window to windows and execution waypoints
-                self.windows.append(neutral_window_copy)
-                self.execution_waypoints.extend(neutral_window_copy.execution_waypoints)
+            # Pre-fill with blend window if provided (created from delayed start)
+            if blend_window is not None:                
+                # Add the blend window to windows and execution waypoints
+                self.windows.append(blend_window)
+                self.execution_waypoints.extend(blend_window.execution_waypoints)
     
     def clear(self):
         """
@@ -835,13 +833,13 @@ class DiffSHEGRealtimeWrapper:
         self.last_generated_motion = None
         
         # Track the last executed waypoint for monitoring and debugging
-        self.last_executed_waypoint: Optional[GestureWaypoint] = None
-        
-        # Create prefilled neutral window for delayed start (if configured)
-        self.prefill_neutral_window: Optional[WaypointWindow] = None
-        if delayed_start_sec is not None and delayed_start_sec > 0:
-            self.prefill_neutral_window = self._create_neutral_window()
-            self.logger.info(f"Created neutral prefill window for delayed start ({delayed_start_sec}s)")
+        # Initialize to a neutral waypoint for the first blend transition
+        self.last_executed_waypoint: GestureWaypoint = GestureWaypoint(
+            waypoint_index=0,
+            timestamp=0.0,
+            gesture_data=self.neutral_position.copy(),
+            is_for_execution=False
+        )
         
         self.logger.info(f"DiffSHEG parameters: window_size={self.window_size}, overlap={self.overlap_len}, step={self.window_step}, fps={self.gesture_fps}")
 
@@ -867,63 +865,6 @@ class DiffSHEGRealtimeWrapper:
             self.logger.warning(
                 f"Mel frame rate {mel_frame_rate:.3f} does not match gesture FPS {self.gesture_fps}; check configuration."
             )
-
-    def _create_neutral_window(self) -> WaypointWindow:
-        """
-        Create a prefilled window with neutral positions for all gestures.
-        
-        This is used when generation_delayed_start_sec > 0 to provide initial playable content
-        during the delayed start period. All waypoints use the neutral position defined in
-        self.neutral_position (which includes masked joint customizations).
-        
-        Returns:
-            WaypointWindow with window_step execution waypoints + overlap_len context waypoints,
-            all filled with neutral positions. Timestamps are NOT set here; they will be set
-            in initialize_new_utterance when start_time is known.
-        """
-        execution_waypoints = []
-        context_waypoints = []
-        
-        # Create execution waypoints (window_step frames) with neutral positions
-        for i in range(self.window_step):
-            waypoint = GestureWaypoint(
-                waypoint_index=i,  # Temporary, will be updated in initialize_new_utterance
-                timestamp=0.0,     # Temporary, will be updated in initialize_new_utterance
-                gesture_data=self.neutral_position.copy(),
-                is_for_execution=True
-            )
-            execution_waypoints.append(waypoint)
-        
-        # Create context waypoints (overlap_len frames) with neutral positions
-        for i in range(self.overlap_len):
-            waypoint = GestureWaypoint(
-                waypoint_index=self.window_step + i,  # Temporary, will be updated in initialize_new_utterance
-                timestamp=0.0,                        # Temporary, will be updated in initialize_new_utterance
-                gesture_data=self.neutral_position.copy(),
-                is_for_execution=False
-            )
-            context_waypoints.append(waypoint)
-        
-        # Create window (window_index will be 0 for the prefill)
-        window = WaypointWindow(
-            window_index=0,
-            execution_waypoints=execution_waypoints,
-            context_waypoints=context_waypoints
-        )
-        
-
-        # Set proper timestamps for all waypoints
-        # Frame indices start at 0 for the prefilled window, timestamps are relative to utterance start
-        for i, waypoint in enumerate(window.execution_waypoints):
-            waypoint.waypoint_index = i
-            waypoint.timestamp = i / self.gesture_fps
-        
-        # Set timestamps for context waypoints
-        for i, waypoint in enumerate(window.context_waypoints):
-            waypoint.waypoint_index = self.window_step + i
-            waypoint.timestamp = (self.window_step + i) / self.gesture_fps
-
-        return window
 
     def _create_blend_to_neutral_window(self, last_waypoint: GestureWaypoint, blend_duration_sec: float) -> WaypointWindow:
         """
@@ -1261,11 +1202,21 @@ class DiffSHEGRealtimeWrapper:
                 ## Stop the old utterance if it exists (this will initiate blend or transition to idle)
                 self.stop_current_utterance(will_lock=False)
                 
+                ## Create blend-to-neutral window if delayed start is configured
+                blend_window_for_new_utterance = None
+                if self.current_utterance.generation_delayed_start_sec is not None and self.current_utterance.generation_delayed_start_sec > 0:
+                    # Create blend window that blends from neutral to neutral over the delayed start duration
+                    # This provides smooth initial gesture content during the delayed start period
+                    blend_window_for_new_utterance = self._create_blend_to_neutral_window(
+                        self.last_executed_waypoint,
+                        self.current_utterance.generation_delayed_start_sec
+                    )
+                
                 ## Initialize the new utterance with ID and start time
                 self.current_utterance.initialize_new_utterance(
                     utterance_id=utterance_id,
                     start_time=curren_time,
-                    prefill_neutral_window=self.prefill_neutral_window
+                    blend_window=blend_window_for_new_utterance
                 )
                 self.logger.info(f"Utterance object changed to new id={utterance_id}, playback should have started.")
                 
@@ -1800,12 +1751,12 @@ class DiffSHEGRealtimeWrapper:
                     
                     # Update window indices for next generation (only if not tail generation)
                     # For tail generation, this was the last window, so no need to update indices
-                    if max_valid_frames is None:
-                        prev_window_end = self.current_utterance.next_window_end_sample
-                        self.current_utterance.update_window_indices()
+                    prev_window_end = self.current_utterance.next_window_end_sample
+                    self.current_utterance.update_window_indices()
+                    if not is_tail_generation:
                         self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{self.current_utterance.next_window_start_sample}-{self.current_utterance.next_window_end_sample}] (step={self.current_utterance.next_window_start_sample - (prev_window_end - (self.current_utterance.next_window_end_sample - self.current_utterance.next_window_start_sample))} samples)")
                     else:
-                        self.logger.info(f"Utterance {utterance_id} tail generation complete - no more windows to generate")
+                        self.logger.debug(f'Tail generation for utterance {utterance_id} completed, no further window updates needed. Window index updated to prevent repeated tail generation.')
 
     def _generate_gesture_window_from_audio(
         self, 
