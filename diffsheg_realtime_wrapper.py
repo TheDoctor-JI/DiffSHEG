@@ -1047,6 +1047,10 @@ class DiffSHEGRealtimeWrapper:
         self.blend_to_neutral_duration = self.config.get('co_speech_gestures', {}).get('blend_to_neutral_duration', 1.0)
         self.logger.info(f"Blend to neutral duration: {self.blend_to_neutral_duration}s")
 
+        # Load initial blend duration from config
+        self.initial_blend_duration = self.config.get('co_speech_gestures', {}).get('initial_blend_duration', 0.5)
+        self.logger.info(f"Initial blend duration (from neutral): {self.initial_blend_duration}s")
+
         # Playback state management
         self.playback_state = PlaybackState.IDLE
         self.playback_state_lock = threading.Lock()
@@ -1129,12 +1133,15 @@ class DiffSHEGRealtimeWrapper:
         Non-masked joints remain constant at their start position throughout the blend.
         
         For consistency with normal gesture windows, this blend window includes context waypoints
-        (last overlap_len frames) set to the neutral position. This provides proper inpainting
-        context for the first real generation window when it follows this blend window.
+        (last overlap_len frames) set to the neutral position. These context waypoints are used
+        for inpainting the first real generation window. Additionally, to ensure smooth motion
+        despite the diffusion model not guaranteeing smoothness, SLERP blending is applied to
+        the initial portion of the first generated window (see initial_blend_duration config).
         
         Args:
             last_waypoint: The last executed waypoint to blend from
             blend_duration_sec: Duration of the blend in seconds
+            debug: Enable debug logging for SLERP trajectory
             
         Returns:
             WaypointWindow containing the blend trajectory with context waypoints set to neutral
@@ -2273,6 +2280,8 @@ class DiffSHEGRealtimeWrapper:
         4. Extract HuBERT if enabled: get_hubert_from_16k_speech_long(...) then interpolate
         5. Window the features to get current window (window_size frames)
         6. Generate with trainer.generate_batch() using inpainting for overlap
+        7. For first window after delayed start (window_idx==1): Apply SLERP blending to
+           initial portion (initial_blend_duration) to ensure smooth transition from neutral
         
         Args:
             audio_bytes_truncated: Raw audio bytes (s16le encoded)
@@ -2468,6 +2477,46 @@ class DiffSHEGRealtimeWrapper:
                 )
             
             execution_waypoints.append(waypoint)
+        
+        # ===== STEP 10: Apply initial SLERP blending for first window after delayed start =====
+        # When delayed_start is used, the first real generation window (window_idx == 1) follows
+        # the blend window (window_idx == 0). Even though we use inpainting with neutral context,
+        # the diffusion model doesn't guarantee smooth transitions. Apply SLERP blending to the
+        # initial portion of the first window to ensure smooth motion from neutral.
+        window_idx = window_start_frame // self.window_step
+        if window_idx == 1 and self.initial_blend_duration > 0 and execution_waypoints:
+            # Calculate how many frames to blend based on initial_blend_duration
+            num_blend_frames = int(self.initial_blend_duration * gesture_fps)
+            num_blend_frames = min(num_blend_frames, len(execution_waypoints))  # Don't exceed available frames
+            
+            if num_blend_frames > 0:
+                self.logger.info(
+                    f"Utterance {utterance_id} window 1: Applying initial SLERP blend from neutral "
+                    f"for first {num_blend_frames} frames ({self.initial_blend_duration}s)"
+                )
+                
+                # Get the target pose (last frame to blend to)
+                target_pose = execution_waypoints[num_blend_frames - 1].gesture_data.copy()
+                
+                # Perform SLERP interpolation from neutral to target
+                blended_poses = slerp_interpolate_axis_angles(
+                    start_pose=self.neutral_position.copy(),
+                    end_pose=target_pose,
+                    joint_mask_indices=self.joint_mask_indices,
+                    num_frames=num_blend_frames,
+                    split_pos=self.split_pos,
+                    axis_angle_mean=self.axis_angle_mean,
+                    axis_angle_std=self.axis_angle_std,
+                    debug=False
+                )
+                
+                # Replace the first num_blend_frames waypoints with blended versions
+                for i in range(num_blend_frames):
+                    execution_waypoints[i].gesture_data = blended_poses[i]
+                
+                self.logger.debug(
+                    f"Utterance {utterance_id} window 1: Initial blend applied successfully"
+                )
         
         # Create beyond-utterance waypoints (frames beyond max_valid_frames) for natural ending blend
         # These correspond to zero-padded audio and naturally transition toward neutral
