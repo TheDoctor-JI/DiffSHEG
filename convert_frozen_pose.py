@@ -5,6 +5,17 @@ Convert Frozen Skeleton Pose to Normalized Custom Neutral Positions
 This script converts a frozen skeleton pose (exported from the test mode GUI)
 into normalized custom neutral positions that can be used in the DiffSHEG wrapper.
 
+CRITICAL INFORMATION ABOUT ANGULAR FORMAT:
+===========================================
+
+The model uses axis_angle=True (see opt.txt), which means:
+1. Model outputs: NORMALIZED axis-angle representation
+2. Wrapper applies joint mask: Uses custom_neutral_positions in NORMALIZED axis-angle space
+3. Server waypoint_post_proc: Converts NORMALIZED axis-angle → DENORMALIZED Euler degrees
+4. Frontend displays: DENORMALIZED Euler degrees
+5. Frozen pose export: DENORMALIZED Euler degrees
+6. This script: Converts DENORMALIZED Euler degrees → NORMALIZED axis-angle
+
 CONVERSION PROCESS:
 ===================
 
@@ -12,9 +23,14 @@ CONVERSION PROCESS:
    - Contains denormalized Euler angles in degrees (as displayed in Three.js)
    - These are the actual joint rotations from the frozen pose
 
-2. Normalization: 
-   - Uses the same bvh_mean.npy and bvh_std.npy as the training data
-   - Formula: normalized = (denormalized - mean) / std
+2. Conversion Steps (REVERSE of waypoint_post_proc):
+   a. Start with: Denormalized Euler degrees (from frozen pose)
+   b. Convert to: Euler radians
+   c. Convert to: axis-angle representation
+   d. Normalize: (axis_angle - mean_axis) / std_axis
+   
+   This produces NORMALIZED axis-angle values that can be used directly
+   in the wrapper's joint masking, matching the model output format
    
 3. Output: custom_neutral_positions_*.yaml
    - Contains normalized values ready for use in embodiment_manager_config.yaml
@@ -25,8 +41,11 @@ USAGE:
 
 python convert_frozen_pose.py \\
     --input frozen_skeleton_1234567890.yaml \\
-    --cache_name beat_4english_15_141 \\
     --output custom_neutral_positions.yaml
+
+NOTE: The cache name is HARDCODED to 'beat_4english_15_141' to match the server configuration.
+This ensures the normalization statistics used here EXACTLY match what the co-speech gesture
+server uses for denormalization.
 
 Then copy the output YAML content to embodiment_manager_config.yaml:
 
@@ -47,6 +66,18 @@ import yaml
 import numpy as np
 import argparse
 from pathlib import Path
+import torch
+
+# Add DiffSHEG to path for rotation conversion utilities
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, script_dir)
+
+try:
+    from utils import rotation_conversions as rot_cvt
+except ImportError as e:
+    print(f"ERROR: Failed to import rotation_conversions from DiffSHEG utils: {e}")
+    print("Make sure you're running this script from the DiffSHEG directory.")
+    sys.exit(1)
 
 # BEAT skeleton joint order - must match diffsheg_realtime_wrapper.py and read_frame_val.py
 BEAT_GESTURE_JOINT_ORDER = [
@@ -124,69 +155,95 @@ def load_frozen_pose(yaml_path: str) -> dict:
 
 def load_normalization_stats(cache_name: str, script_dir: str):
     """
-    Load normalization statistics (mean and std) for Euler angles.
+    Load normalization statistics for axis-angle representation.
+    
+    CRITICAL: This function MUST use the exact same paths and statistics as
+    co_speech_gesture_server.py to ensure the conversion is correct.
+    
+    Since the model uses axis_angle=True, we need axis-angle statistics
+    to convert frozen poses (Euler degrees) back to normalized axis-angle.
     
     Args:
-        cache_name: Cache name (e.g., 'beat_4english_15_141')
+        cache_name: Cache name (HARDCODED to 'beat_4english_15_141' in main())
         script_dir: Directory containing this script
         
     Returns:
-        Tuple of (mean_array, std_array) as numpy arrays of shape (141,)
+        Tuple of (mean_axis, std_axis) as numpy arrays of shape (141,)
     """
-    # Construct paths matching co_speech_gesture_server.py
+    # Construct paths matching co_speech_gesture_server.py EXACTLY
+    # Server path: os.path.join(script_dir, "DiffSHEG", "data", "BEAT", "beat_cache", opt.beat_cache_name, "train")
+    # This script is IN DiffSHEG/, so we don't need the "DiffSHEG" part
     stats_dir = os.path.join(script_dir, "data", "BEAT", "beat_cache", cache_name, "train")
     
-    mean_euler_path = os.path.join(stats_dir, "bvh_rot", "bvh_mean.npy")
-    std_euler_path = os.path.join(stats_dir, "bvh_rot", "bvh_std.npy")
+    mean_axis_path = os.path.join(stats_dir, "axis_angle_mean.npy")
+    std_axis_path = os.path.join(stats_dir, "axis_angle_std.npy")
     
-    if not os.path.exists(mean_euler_path):
+    # Print paths for verification
+    print(f"      Loading AXIS-ANGLE statistics (model uses axis_angle=True):")
+    print(f"      - Mean: {mean_axis_path}")
+    print(f"      - Std:  {std_axis_path}")
+    
+    if not os.path.exists(mean_axis_path):
         raise FileNotFoundError(
-            f"Euler mean file not found: {mean_euler_path}\n"
+            f"Axis-angle mean file not found: {mean_axis_path}\n"
             f"Make sure cache_name '{cache_name}' is correct and data exists."
         )
     
-    if not os.path.exists(std_euler_path):
+    if not os.path.exists(std_axis_path):
         raise FileNotFoundError(
-            f"Euler std file not found: {std_euler_path}\n"
+            f"Axis-angle std file not found: {std_axis_path}\n"
             f"Make sure cache_name '{cache_name}' is correct and data exists."
         )
     
-    mean_euler = np.load(mean_euler_path)
-    std_euler = np.load(std_euler_path)
+    mean_axis = np.load(mean_axis_path)
+    std_axis = np.load(std_axis_path)
     
     # Validate dimensions
-    if mean_euler.shape[0] != 141:
+    if mean_axis.shape[0] != 141:
         raise ValueError(
-            f"Invalid mean_euler shape: {mean_euler.shape}, expected (141,). "
+            f"Invalid mean_axis shape: {mean_axis.shape}, expected (141,). "
             f"This should contain 47 joints × 3 = 141 dimensions."
         )
     
-    if std_euler.shape[0] != 141:
+    if std_axis.shape[0] != 141:
         raise ValueError(
-            f"Invalid std_euler shape: {std_euler.shape}, expected (141,). "
+            f"Invalid std_axis shape: {std_axis.shape}, expected (141,). "
             f"This should contain 47 joints × 3 = 141 dimensions."
         )
     
-    return mean_euler, std_euler
+    return mean_axis, std_axis
 
 
-def normalize_euler_angles(denormalized_angles: dict, mean_pose: np.ndarray, std_pose: np.ndarray) -> dict:
+def convert_euler_to_normalized_axis_angle(denormalized_angles: dict, mean_axis: np.ndarray, std_axis: np.ndarray) -> dict:
     """
-    Convert denormalized Euler angles to normalized space.
+    Convert denormalized Euler angles (degrees) to normalized axis-angle representation.
     
-    This is the INVERSE of the denormalization process:
-    - Denormalization (in waypoint_post_proc): denorm = norm * std + mean
-    - Normalization (this function): norm = (denorm - mean) / std
+    This is the COMPLETE INVERSE of waypoint_post_proc() with axis_angle=True:
+    
+    Server waypoint_post_proc flow:
+    1. Input: NORMALIZED axis-angle (from model output)
+    2. Denormalize: denorm_axis = norm_axis * std_axis + mean_axis
+    3. Convert: axis-angle → Euler (radians) → Euler (degrees)
+    4. Output: DENORMALIZED Euler degrees (to frontend)
+    
+    This function does the REVERSE:
+    1. Input: DENORMALIZED Euler degrees (from frozen pose)
+    2. Convert: Euler (degrees) → Euler (radians) → axis-angle
+    3. Normalize: norm_axis = (axis_angle - mean_axis) / std_axis
+    4. Output: NORMALIZED axis-angle (for custom_neutral_positions)
     
     Args:
         denormalized_angles: Dict of joint_name -> [x, y, z] in degrees (from frozen pose)
-        mean_pose: numpy array of shape (141,) - Euler mean from bvh_mean.npy
-        std_pose: numpy array of shape (141,) - Euler std from bvh_std.npy
+        mean_axis: numpy array of shape (141,) - axis-angle mean from axis_angle_mean.npy
+        std_axis: numpy array of shape (141,) - axis-angle std from axis_angle_std.npy
     
     Returns:
-        Dict of joint_name -> [x_norm, y_norm, z_norm] in normalized space
+        Dict of joint_name -> [x_norm, y_norm, z_norm] in normalized axis-angle space
     """
     normalized = {}
+    
+    # Collect all Euler angles in order for batch conversion
+    euler_degrees_full = np.zeros(141, dtype=np.float32)
     
     for joint_name, angles in denormalized_angles.items():
         # Validate joint name
@@ -203,27 +260,60 @@ def normalize_euler_angles(denormalized_angles: dict, mean_pose: np.ndarray, std
             print(f"⚠️  Warning: Invalid angles for '{joint_name}': {angles}, skipping")
             continue
         
-        # Extract denormalized values (in degrees)
-        denorm = np.array(angles, dtype=np.float32)
+        # Store in full array
+        euler_degrees_full[start_idx:start_idx+3] = angles
+    
+    # Convert to radians
+    euler_radians = euler_degrees_full * (np.pi / 180.0)
+    
+    # Reshape for rotation conversion: (141,) → (47, 3)
+    euler_radians_reshaped = euler_radians.reshape(47, 3)
+    
+    # Convert Euler (radians) → axis-angle using DiffSHEG's rotation utilities
+    # This is the INVERSE of what waypoint_post_proc does
+    euler_tensor = torch.from_numpy(euler_radians_reshaped).float()
+    axis_angle_tensor = rot_cvt.euler_angles_to_axis_angle(euler_tensor)  # (47, 3)
+    axis_angle = axis_angle_tensor.numpy().reshape(-1)  # (141,)
+    
+    # Normalize: (axis_angle - mean) / std
+    normalized_axis_angle = (axis_angle - mean_axis) / std_axis
+    
+    # Extract per-joint values
+    for joint_name in denormalized_angles.keys():
+        if joint_name not in BEAT_GESTURE_JOINT_ORDER:
+            continue
+            
+        joint_idx = BEAT_GESTURE_JOINT_ORDER.index(joint_name)
+        start_idx = joint_idx * 3
         
-        # Get corresponding mean/std for this joint (3 channels: X, Y, Z)
-        mean_vals = mean_pose[start_idx:start_idx+3]
-        std_vals = std_pose[start_idx:start_idx+3]
-        
-        # Normalize: (denorm - mean) / std
-        norm_vals = (denorm - mean_vals) / std_vals
-        
+        norm_vals = normalized_axis_angle[start_idx:start_idx+3]
         normalized[joint_name] = norm_vals.tolist()
+        
+        # Debug: Print first joint conversion for verification
+        if joint_name == BEAT_GESTURE_JOINT_ORDER[0]:  # First joint (Spine)
+            euler_deg = euler_degrees_full[start_idx:start_idx+3]
+            euler_rad = euler_radians[start_idx:start_idx+3]
+            axis_unnorm = axis_angle[start_idx:start_idx+3]
+            mean_vals = mean_axis[start_idx:start_idx+3]
+            std_vals = std_axis[start_idx:start_idx+3]
+            
+            print(f"\n      [DEBUG] First joint conversion ({joint_name}):")
+            print(f"              1. Input (Euler deg):      [{euler_deg[0]:.6f}, {euler_deg[1]:.6f}, {euler_deg[2]:.6f}]")
+            print(f"              2. Euler (radians):        [{euler_rad[0]:.6f}, {euler_rad[1]:.6f}, {euler_rad[2]:.6f}]")
+            print(f"              3. Axis-angle (denorm):    [{axis_unnorm[0]:.6f}, {axis_unnorm[1]:.6f}, {axis_unnorm[2]:.6f}]")
+            print(f"              4. Axis-angle mean:        [{mean_vals[0]:.6f}, {mean_vals[1]:.6f}, {mean_vals[2]:.6f}]")
+            print(f"              5. Axis-angle std:         [{std_vals[0]:.6f}, {std_vals[1]:.6f}, {std_vals[2]:.6f}]")
+            print(f"              6. Output (norm axis-ang): [{norm_vals[0]:.6f}, {norm_vals[1]:.6f}, {norm_vals[2]:.6f}]")
     
     return normalized
 
 
 def save_custom_neutral_positions(normalized_angles: dict, output_path: str):
     """
-    Save normalized angles as custom_neutral_positions YAML.
+    Save normalized axis-angle values as custom_neutral_positions YAML.
     
     Args:
-        normalized_angles: Dict of joint_name -> [x_norm, y_norm, z_norm]
+        normalized_angles: Dict of joint_name -> [x_norm, y_norm, z_norm] in normalized axis-angle space
         output_path: Output YAML file path
     """
     # Save to file
@@ -231,7 +321,8 @@ def save_custom_neutral_positions(normalized_angles: dict, output_path: str):
         # Write header comments
         f.write('# Custom Neutral Positions for DiffSHEG Wrapper\n')
         f.write('# Generated from frozen skeleton pose\n')
-        f.write('# These values are NORMALIZED and ready for use in embodiment_manager_config.yaml\n')
+        f.write('# These values are NORMALIZED AXIS-ANGLE and ready for use in embodiment_manager_config.yaml\n')
+        f.write('# The model uses axis_angle=True, so custom_neutral_positions must be in this format.\n')
         f.write('#\n')
         f.write('# USAGE:\n')
         f.write('# Copy the custom_neutral_positions section to your embodiment_manager_config.yaml:\n')
@@ -298,12 +389,19 @@ def main():
         help='Input frozen skeleton YAML file (frozen_skeleton_*.yaml)'
     )
     
-    parser.add_argument(
-        '--cache_name',
-        type=str,
-        default='beat_4english_15_141',
-        help='Cache name for loading normalization statistics (default: beat_4english_15_141)'
-    )
+    # HARDCODED: Must match co_speech_gesture_server.py exactly
+    # The server uses opt.beat_cache_name which defaults to 'beat_4english_15_141'
+    # from DiffSHEG/options/base_options.py
+    # DO NOT change this unless you change the server configuration!
+    HARDCODED_CACHE_NAME = 'beat_4english_15_141'
+    
+    # Remove --cache_name argument - no longer configurable to prevent mismatches
+    # parser.add_argument(
+    #     '--cache_name',
+    #     type=str,
+    #     default='beat_4english_15_141',
+    #     help='Cache name for loading normalization statistics (default: beat_4english_15_141)'
+    # )
     
     parser.add_argument(
         '--output',
@@ -329,7 +427,7 @@ def main():
     print("FROZEN POSE TO CUSTOM NEUTRAL POSITIONS CONVERTER")
     print("="*80)
     print(f"Input file:  {args.input}")
-    print(f"Cache name:  {args.cache_name}")
+    print(f"Cache name:  {HARDCODED_CACHE_NAME} (hardcoded to match server)")
     print(f"Output file: {args.output}")
     print("="*80)
     
@@ -341,16 +439,20 @@ def main():
         
         # Step 2: Load normalization statistics
         print("\n[2/4] Loading normalization statistics...")
+        print("      Model uses axis_angle=True, so loading axis-angle statistics")
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        mean_euler, std_euler = load_normalization_stats(args.cache_name, script_dir)
-        print(f"      ✓ Loaded mean and std from cache '{args.cache_name}'")
-        print(f"      - Mean shape: {mean_euler.shape}")
-        print(f"      - Std shape:  {std_euler.shape}")
+        mean_axis, std_axis = load_normalization_stats(HARDCODED_CACHE_NAME, script_dir)
+        print(f"      ✓ Loaded axis-angle mean and std from cache '{HARDCODED_CACHE_NAME}'")
+        print(f"      - Mean shape: {mean_axis.shape}")
+        print(f"      - Std shape:  {std_axis.shape}")
+        print(f"      - Sample mean values (first 3): {mean_axis[:3]}")
+        print(f"      - Sample std values (first 3):  {std_axis[:3]}")
         
-        # Step 3: Normalize angles
-        print("\n[3/4] Converting to normalized space...")
-        normalized_angles = normalize_euler_angles(denormalized_angles, mean_euler, std_euler)
-        print(f"      ✓ Normalized {len(normalized_angles)} joints")
+        # Step 3: Convert to normalized axis-angle
+        print("\n[3/4] Converting Euler degrees → normalized axis-angle...")
+        print("      This involves: Euler(deg) → Euler(rad) → axis-angle → normalize")
+        normalized_angles = convert_euler_to_normalized_axis_angle(denormalized_angles, mean_axis, std_axis)
+        print(f"      ✓ Converted {len(normalized_angles)} joints")
         
         # Step 4: Save output
         print("\n[4/4] Saving custom neutral positions...")
@@ -363,6 +465,10 @@ def main():
         print("\n" + "="*80)
         print("NEXT STEPS")
         print("="*80)
+        print("\n✓ SUCCESS: Converted frozen pose to NORMALIZED AXIS-ANGLE format")
+        print(f"\n  Output file: {args.output}")
+        print(f"  Format: Normalized axis-angle (matching model output space)")
+        print(f"  Joints converted: {len(normalized_angles)}")
         print("\n1. Open your embodiment_manager_config.yaml")
         print("\n2. Add the custom_neutral_positions to the co_speech_gestures section:")
         print("\n   co_speech_gestures:")
@@ -374,6 +480,7 @@ def main():
         print(f"       # Copy content from: {args.output}")
         print("\n3. Restart the co_speech_gesture_server")
         print("\n4. Masked joints will now use your custom neutral positions!")
+        print("\nIMPORTANT: The values in the config are NORMALIZED AXIS-ANGLE, not Euler degrees!")
         print("="*80)
         
     except Exception as e:
