@@ -53,7 +53,7 @@ import traceback
 import tempfile
 import os
 from copy import deepcopy
-
+from utils.PlaybackState import PlaybackState
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -793,6 +793,19 @@ class DiffSHEGRealtimeWrapper:
         # If elapsed time exceeds prescribed duration by this threshold, stop utterance
         self.duration_timeout_threshold = self.config.get('co_speech_gestures', {}).get('duration_timeout_threshold', 2.0)
 
+        # Load blend to neutral duration from config
+        self.blend_to_neutral_duration = self.config.get('co_speech_gestures', {}).get('blend_to_neutral_duration', 1.0)
+        self.logger.info(f"Blend to neutral duration: {self.blend_to_neutral_duration}s")
+
+        # Playback state management
+        self.playback_state = PlaybackState.IDLE
+        self.playback_state_lock = threading.Lock()
+        
+        # Blend window tracking
+        self.blend_window: Optional[WaypointWindow] = None
+        self.blend_start_time: Optional[float] = None
+        self.blend_last_executed_waypoint_index: int = -1
+
         # Current utterance tracking (created once and reused)
         self.current_utterance: Utterance = Utterance(
             utterance_id=Utterance.PLACE_HOLDER_ID,  # Placeholder ID, will be updated when first chunk arrives
@@ -910,6 +923,53 @@ class DiffSHEGRealtimeWrapper:
             waypoint.waypoint_index = self.window_step + i
             waypoint.timestamp = (self.window_step + i) / self.gesture_fps
 
+        return window
+
+    def _create_blend_to_neutral_window(self, last_waypoint: GestureWaypoint, blend_duration_sec: float) -> WaypointWindow:
+        """
+        Create a window that blends from the last executed waypoint to neutral position.
+        
+        This window linearly interpolates the masked joint angles from the last executed
+        waypoint to the neutral position over the specified duration.
+        
+        Args:
+            last_waypoint: The last executed waypoint to blend from
+            blend_duration_sec: Duration of the blend in seconds
+            
+        Returns:
+            WaypointWindow containing the blend trajectory
+        """
+        # Calculate number of frames for the blend based on gesture FPS
+        num_frames = max(1, int(blend_duration_sec * self.gesture_fps))
+        
+        # Get start and end positions
+        start_pose = last_waypoint.gesture_data.copy()
+        end_pose = self.neutral_position.copy()
+        
+        # Create waypoints with linear interpolation
+        execution_waypoints = []
+        for i in range(num_frames):
+            # Linear interpolation factor (0 at start, 1 at end)
+            alpha = (i + 1) / num_frames
+            
+            # Interpolate between start and end
+            blended_pose = start_pose * (1 - alpha) + end_pose * alpha
+            
+            waypoint = GestureWaypoint(
+                waypoint_index=i,
+                timestamp=i / self.gesture_fps,  # Relative to blend start
+                gesture_data=blended_pose,
+                is_for_execution=True
+            )
+            execution_waypoints.append(waypoint)
+        
+        # No context waypoints needed for blend window (this is the final window)
+        window = WaypointWindow(
+            window_index=0,  # Blend window is standalone
+            execution_waypoints=execution_waypoints,
+            context_waypoints=[]
+        )
+        
         return window
 
     def _warmup_cuda_context(self):
@@ -1151,13 +1211,19 @@ class DiffSHEGRealtimeWrapper:
         """
         Reset all state-related variables.
         
-        This clears the current utterance content and stopped history.
+        This clears the current utterance content, stopped history, and playback state.
         Useful for starting fresh or cleaning up after a session ends.
-        """
+        """        
         with self.utterance_lock:
             self.current_utterance.clear()
             self.stopped_utterances.clear()
             self.last_executed_waypoint = None
+        
+        with self.playback_state_lock:
+            self.playback_state = PlaybackState.IDLE
+            self.blend_window = None
+            self.blend_start_time = None
+            self.blend_last_executed_waypoint_index = -1
 
     '''
     Utterance lifecycle methods
@@ -1192,7 +1258,7 @@ class DiffSHEGRealtimeWrapper:
             # If this is a new utterance, clear the old one and update ID
             if self.current_utterance.utterance_id != utterance_id:
                 
-                ## Stop the old utterance if it exists
+                ## Stop the old utterance if it exists (this will initiate blend or transition to idle)
                 self.stop_current_utterance(will_lock=False)
                 
                 ## Initialize the new utterance with ID and start time
@@ -1202,6 +1268,18 @@ class DiffSHEGRealtimeWrapper:
                     prefill_neutral_window=self.prefill_neutral_window
                 )
                 self.logger.info(f"Utterance object changed to new id={utterance_id}, playback should have started.")
+                
+                ## Update playback state to IN_UTTERANCE
+                with self.playback_state_lock:
+                    # Cancel any ongoing blend
+                    if self.playback_state == PlaybackState.BLENDING_TO_NEUTRAL:
+                        self.logger.info("New utterance started, cancelling ongoing blend")
+                        self.blend_window = None
+                        self.blend_start_time = None
+                        self.blend_last_executed_waypoint_index = -1
+                    
+                    self.playback_state = PlaybackState.IN_UTTERANCE
+                    self.logger.debug(f"Playback state transitioned to IN_UTTERANCE for utterance {utterance_id}")
                         
             # Add audio samples to utterance
             audio_samples_before = self.current_utterance.get_total_samples()
@@ -1213,7 +1291,7 @@ class DiffSHEGRealtimeWrapper:
     
     def stop_current_utterance(self, will_lock: bool):
         """
-        Clear the current utterance content and prepare it for reuse.
+        Clear the current utterance content and initiate blending to neutral.
         
         Since gesture generation is faster than realtime, it's safe to simply
         clear the current utterance and all its waypoints when stopped.
@@ -1222,6 +1300,11 @@ class DiffSHEGRealtimeWrapper:
         This also prevents late-arriving chunks for this utterance from being
         processed by tracking stopped utterance IDs in a set.
         
+        After stopping the utterance, this method initiates a blend to neutral position
+        if there was a last executed waypoint. Blend is only initiated once per utterance,
+        even if this method is called multiple times (e.g., timeout followed by cancellation).
+        
+        Thread-safe: Can be called from multiple sources without duplicate blend initiation.
         """
         if will_lock:
             self.utterance_lock.acquire()
@@ -1229,14 +1312,27 @@ class DiffSHEGRealtimeWrapper:
         try:
             # Add to stopped set to reject any late-arriving chunks
             if self.current_utterance.utterance_id != Utterance.PLACE_HOLDER_ID:
-                self.stopped_utterances.add(self.current_utterance.utterance_id)
+                utterance_id = self.current_utterance.utterance_id
+                
+                # Check if this utterance was already stopped
+                if utterance_id in self.stopped_utterances:
+                    self.logger.debug(f"Utterance {utterance_id} already stopped, skipping duplicate stop")
+                    return
+                
+                # Mark as stopped
+                self.stopped_utterances.add(utterance_id)
                 
                 # Clear the utterance content but keep the object alive
                 total_samples = self.current_utterance.get_total_samples()
-                self.logger.debug(f"Stop utterance {self.current_utterance.utterance_id} (had {total_samples} samples)")
-                
+                self.logger.debug(f"Stop utterance {utterance_id} (had {total_samples} samples)")
+
                 # Clear all content for reuse
                 self.current_utterance.clear()
+                
+                # Initiate blend to neutral if we have a last waypoint
+                # The _initiate_blend_to_neutral method will check the current state
+                # to ensure blend is only started when transitioning from IN_UTTERANCE
+                self._initiate_blend_to_neutral(self.last_executed_waypoint)
                 
         except Exception as e:
             self.logger.error(f'Failed to stop utterance with exception: {type(e).__name__}: {e}')
@@ -1279,76 +1375,160 @@ class DiffSHEGRealtimeWrapper:
             if will_lock:
                 self.utterance_lock.release()
 
-
+    def _initiate_blend_to_neutral(self, last_waypoint: Optional[GestureWaypoint]):
+        """
+        Initiate blending to neutral position from the last executed waypoint.
+        
+        This method should be called when transitioning out of an utterance.
+        It creates a blend window and updates the playback state.
+        
+        State transition guard: Only initiates blend when currently IN_UTTERANCE.
+        This prevents duplicate blend initiation if stop_current_utterance is called
+        multiple times (e.g., timeout followed by cancellation).
+        
+        Args:
+            last_waypoint: The last executed waypoint to blend from, or None if no waypoint was executed
+        """
+        with self.playback_state_lock:
+            # Check current state - only initiate blend if we're currently IN_UTTERANCE
+            if self.playback_state != PlaybackState.IN_UTTERANCE:
+                self.logger.debug(f"Skipping blend initiation - not in IN_UTTERANCE state (current: {self.playback_state.value})")
+                return
+            
+            # Only initiate blend if we have a last waypoint and blend duration > 0
+            if last_waypoint is not None and self.blend_to_neutral_duration > 0:
+                # Create blend window
+                self.blend_window = self._create_blend_to_neutral_window(
+                    last_waypoint=last_waypoint,
+                    blend_duration_sec=self.blend_to_neutral_duration
+                )
+                self.blend_start_time = time.time()
+                self.blend_last_executed_waypoint_index = -1
+                
+                # Update state
+                self.playback_state = PlaybackState.BLENDING_TO_NEUTRAL
+                self.logger.info(f"Initiated blend to neutral (duration={self.blend_to_neutral_duration}s, {len(self.blend_window.execution_waypoints)} frames)")
+            else:
+                # No blending needed, go directly to idle
+                self.blend_window = None
+                self.blend_start_time = None
+                self.blend_last_executed_waypoint_index = -1
+                self.playback_state = PlaybackState.IDLE
+                self.logger.debug("No blend needed, transitioning directly to IDLE")
 
     '''
     Track utterance playback and manage gesture playback
     '''
     def _playback_managing_loop(self):
         """
-        Thread 1: Playback Managing Thread
+        Thread 1: Playback Managing Thread with State Machine
         
-        This thread performs two main tasks:
-        1. Track current time (wall clock and relative to audio start)
-        2. Check if there's a waypoint to execute in the next 10ms interval
+        This thread manages gesture playback through three states:
+        1. IN_UTTERANCE: Executing waypoints for an active utterance
+        2. BLENDING_TO_NEUTRAL: Executing blend window to return to neutral
+        3. IDLE: At neutral position, nothing to execute
+        
+        State transitions:
+        - IDLE -> IN_UTTERANCE: When first audio chunk arrives
+        - IN_UTTERANCE -> BLENDING_TO_NEUTRAL: When utterance stops/ends/times out
+        - IN_UTTERANCE -> IN_UTTERANCE: When new utterance starts (cancels previous)
+        - BLENDING_TO_NEUTRAL -> IDLE: When blend completes
+        - BLENDING_TO_NEUTRAL -> IN_UTTERANCE: When new utterance interrupts blend
         
         Waypoint execution:
         - Gestures are generated as waypoints at 15 FPS (one every ~66.67ms)
         - This thread checks every 10ms for waypoints to execute
         - At most 1 waypoint per 10ms interval (since waypoints are 66.67ms apart)
-        - Retrieves the waypoint if one should be executed in the upcoming interval
-        
-        Playback lifecycle:
-        - Starts automatically when first chunk (index 0) arrives
         """
         interval_duration = 0.01  # 10ms target interval
         
         while self.running:
             iteration_start_time = time.time()
-                        
-            with self.utterance_lock:
-                
-                # Skip if no valid utterance (placeholder ID)
-                if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID:
-                    continue
-                
-                # Skip if playback hasn't started yet (no chunk 0 received)
-                if self.current_utterance.start_time == Utterance.PLACE_HOLDER_TIMESTAMP:
-                    continue
-                
-                # Calculate current playback position (time relative to utterance start)
-                elapsed_time = iteration_start_time - self.current_utterance.start_time
-                
-                # Calculate total audio duration received so far
-                total_samples = self.current_utterance.get_total_samples()
-                total_audio_duration = total_samples / self.current_utterance.sample_rate
-                
-                # Check if utterance has exceeded its prescribed duration by threshold amount
-                if (self.current_utterance.total_duration is not None and 
-                    self.duration_timeout_threshold > 0 and
-                    elapsed_time > self.current_utterance.total_duration + self.duration_timeout_threshold):
-                    self.logger.info(
-                        f"Utterance {self.current_utterance.utterance_id} exceeded duration by {elapsed_time - self.current_utterance.total_duration:.3f}s "
-                        f"(duration={self.current_utterance.total_duration:.3f}s, threshold={self.duration_timeout_threshold:.3f}s). Stopping."
-                    )
-                    self.stop_current_utterance(will_lock=False)
-                    continue
-
-                # Check for waypoint to execute in the next 10ms interval
-                waypoint = self.current_utterance.get_waypoint_to_execute_for_interval(
-                    current_time=elapsed_time,
-                    interval_duration=interval_duration
-                )
-                if waypoint is not None:
-                    # Execute waypoint gesture
-                    self.logger.debug(f"Utterance {self.current_utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
-                    # Store the last executed waypoint for monitoring and debugging
-                    self.last_executed_waypoint = waypoint
-                    # Call the waypoint callback if provided
-                    # Note: Joint mask is already applied during waypoint generation for consistency
-                    if self.waypoint_callback is not None:
-                        self.waypoint_callback(waypoint)
             
+            with self.playback_state_lock:
+                current_state = self.playback_state
+            
+            # State-specific behavior
+            if current_state == PlaybackState.IDLE:
+                # Nothing to do in IDLE state
+                pass
+                
+            elif current_state == PlaybackState.IN_UTTERANCE:
+                # Handle utterance playback
+                with self.utterance_lock:
+                    # Skip if no valid utterance (placeholder ID)
+                    if (
+                        self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID 
+                        or self.current_utterance.start_time == Utterance.PLACE_HOLDER_TIMESTAMP):# Skip if playback hasn't started yet (no chunk 0 received)
+                        pass
+                    else:
+                        # Calculate current playback position (time relative to utterance start)
+                        elapsed_time = iteration_start_time - self.current_utterance.start_time
+                        
+                        # Check if utterance has exceeded its prescribed duration by threshold amount
+                        if ( 
+                            self.current_utterance.total_duration is not None 
+                            and self.duration_timeout_threshold > 0 
+                            and elapsed_time > self.current_utterance.total_duration + self.duration_timeout_threshold):
+                            self.logger.info(
+                                f"Utterance {self.current_utterance.utterance_id} exceeded duration by {elapsed_time - self.current_utterance.total_duration:.3f}s "
+                                f"(duration={self.current_utterance.total_duration:.3f}s, threshold={self.duration_timeout_threshold:.3f}s). Stopping."
+                            )
+                            self.stop_current_utterance(will_lock=False)
+                        else:
+                            # Check for waypoint to execute in the next 10ms interval
+                            waypoint = self.current_utterance.get_waypoint_to_execute_for_interval(
+                                current_time=elapsed_time,
+                                interval_duration=interval_duration
+                            )
+                            if waypoint is not None:
+                                # Execute waypoint gesture
+                                self.logger.debug(f"Utterance {self.current_utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
+                                # Store the last executed waypoint for monitoring and debugging
+                                self.last_executed_waypoint = waypoint
+                                # Call the waypoint callback if provided
+                                if self.waypoint_callback is not None:
+                                    self.waypoint_callback(waypoint)
+                            
+            elif current_state == PlaybackState.BLENDING_TO_NEUTRAL:
+                # Handle blend window playback
+                with self.playback_state_lock:
+                    if self.blend_window is None or self.blend_start_time is None:
+                        # Blend was cancelled or completed, transition to idle
+                        self.playback_state = PlaybackState.IDLE
+                        self.logger.debug("Blend window cleared, transitioning to IDLE")
+                    else:
+                        # Calculate elapsed time since blend start
+                        blend_elapsed = iteration_start_time - self.blend_start_time
+                        
+                        # Find waypoint to execute in this interval
+                        waypoint_to_execute = None
+                        for i in range(self.blend_last_executed_waypoint_index + 1, 
+                                      len(self.blend_window.execution_waypoints)):
+                            waypoint = self.blend_window.execution_waypoints[i]
+                            # Check if waypoint falls within current interval
+                            if waypoint.timestamp <= blend_elapsed + interval_duration:
+                                waypoint_to_execute = waypoint
+                                self.blend_last_executed_waypoint_index = i
+                            else:
+                                break
+                        
+                        # Execute waypoint if found
+                        if waypoint_to_execute is not None:
+                            self.logger.debug(f"Blend executing waypoint {waypoint_to_execute.waypoint_index} at t={blend_elapsed:.3f}s")
+                            # Store as last executed waypoint
+                            self.last_executed_waypoint = waypoint_to_execute
+                            # Call callback
+                            if self.waypoint_callback is not None:
+                                self.waypoint_callback(waypoint_to_execute)
+                        
+                        # Check if blend is complete
+                        if self.blend_last_executed_waypoint_index >= len(self.blend_window.execution_waypoints) - 1:
+                            self.logger.info("Blend to neutral completed, transitioning to IDLE")
+                            self.blend_window = None
+                            self.blend_start_time = None
+                            self.blend_last_executed_waypoint_index = -1
+                            self.playback_state = PlaybackState.IDLE
 
             # Sleep for the remaining time to maintain 10ms interval
             elapsed = time.time() - iteration_start_time
