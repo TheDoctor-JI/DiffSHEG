@@ -526,6 +526,14 @@ class DiffSHEGRealtimeWrapper:
                              Should accept a GestureWaypoint object as parameter.
                              If None, waypoints are generated but not executed.
         """
+        # Initialize logger
+        self.logger = setup_logger(
+            logger_name='diffsheg_realtime_wrapper',
+            file_log_level="DEBUG",
+            terminal_log_level="INFO"
+        )
+
+
         self.model = diffsheg_model
         self.opt = opt
         self.config = config or {}
@@ -573,12 +581,6 @@ class DiffSHEGRealtimeWrapper:
             self.logger.info("No joint mask applied - all 141 dimensions will be used")
 
         
-        # Initialize logger
-        self.logger = setup_logger(
-            logger_name='diffsheg_realtime_wrapper',
-            file_log_level="DEBUG",
-            terminal_log_level="INFO"
-        )
         self.logger.info("DiffSHEG Realtime Wrapper initialized")
         self.logger.info(f"Configuration: sample_rate={self.audio_sr}, device={self.device}")
         
