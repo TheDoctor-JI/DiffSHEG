@@ -1558,8 +1558,8 @@ class DiffSHEGRealtimeWrapper:
         self.logger.info("="*60)
         
         # Normal streaming mode
-        self.playback_managing_thread = threading.Thread(target=self._playback_managing_loop, daemon=True)
-        self.generation_thread = threading.Thread(target=self._generation_loop, daemon=True)
+        self.playback_managing_thread = threading.Thread(target=self._playback_managing_loop)
+        self.generation_thread = threading.Thread(target=self._generation_loop)
         self.playback_managing_thread.start()
         self.generation_thread.start()
         self.logger.info("Playback managing and generation threads started")
