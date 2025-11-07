@@ -2518,8 +2518,7 @@ class DiffSHEGRealtimeWrapper:
                     f"Utterance {utterance_id} window 1: Initial blend applied successfully"
                 )
         
-        # Create beyond-utterance waypoints (frames beyond max_valid_frames) for natural ending blend
-        # These correspond to zero-padded audio and naturally transition toward neutral
+        # In tail generation situation, create beyond-utterance waypoints (frames beyond max_valid_frames) for natural ending blend
         if max_valid_frames is not None and num_execution_frames < self.window_step:
             for i in range(num_execution_frames, self.window_step):
                 frame_index = window_start_frame + i
@@ -2543,8 +2542,7 @@ class DiffSHEGRealtimeWrapper:
                 beyond_utterance_waypoints.append(waypoint)
         
         # Create context waypoints (last overlap_len frames) - only if not tail generation
-        # For tail generation with filtered frames, we don't create context waypoints
-        # since there's no next window to use them
+        # For tail generation with filtered frames, we don't create context waypoints since there's no next window to use them
         if self.overlap_len > 0 and max_valid_frames is None:
             for i in range(self.overlap_len):
                 frame_index = window_start_frame + self.window_step + i
