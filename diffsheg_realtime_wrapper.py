@@ -162,10 +162,14 @@ class WaypointWindow:
     - context_waypoints: Last 4 waypoints (frames 30-33) - used for next window's inpainting
     
     The window generates 34 total waypoints but only the first 30 are for execution.
+    
+    With slowdown enabled, execution_waypoints may contain more frames than window_step,
+    and audio_step_samples tracks the extended audio coverage for next window bookkeeping.
     """
     window_index: int  # Sequential window index (0, 1, 2, ...)
-    execution_waypoints: List[GestureWaypoint]  # Waypoints for execution (window_step frames)
+    execution_waypoints: List[GestureWaypoint]  # Waypoints for execution (may be > window_step if slowed down)
     context_waypoints: List[GestureWaypoint]  # Waypoints for next window's inpainting (overlap_len frames)
+    audio_step_samples: int = 0  # Number of audio samples to advance for next window (extended if slowed down)
 
 
 # BEAT skeleton joint order as defined in DiffSHEG data_tools.py
@@ -674,6 +678,9 @@ class Utterance:
         self.execution_waypoints: List[GestureWaypoint] = []  # Flat list of waypoints for execution (only is_for_execution=True)
         self.last_executed_waypoint_index: int = -1  # Cursor for playback
         self.waypoints_lock = threading.Lock()
+        
+        # Window generation tracking
+        self.generated_window_count: int = 0  # Counter for windows generated (used for indexing)
                 
         # Utterance duration tracking
         self.total_duration: Optional[float] = None  # Total duration of the utterance in seconds
@@ -720,15 +727,30 @@ class Utterance:
         
         return self.audio_samples[start_byte:end_byte]
     
-    def update_window_indices(self):
+    def update_window_indices(self, last_window: Optional[WaypointWindow] = None):
         """
         Update window indices for the next generation window.
-        Advances by window_step frames worth of samples.
+        
+        If last_window is provided and has audio_step_samples set, advances by that amount.
+        Otherwise, advances by window_step frames worth of samples (default behavior).
+        
+        This allows for proper bookkeeping when windows are slowed down post-generation,
+        ensuring the next window starts at the correct audio position based on the
+        extended playback duration.
+        
+        Args:
+            last_window: Optional last generated window with audio step information
         """
-        step_duration_samples = int((self.window_step / self.gesture_fps) * self.sample_rate)
+        if last_window is not None and last_window.audio_step_samples > 0:
+            # Use actual audio step from the generated window (may be extended by slowdown)
+            step_samples = last_window.audio_step_samples
+        else:
+            # Default: advance by window_step frames worth of samples
+            step_samples = int((self.window_step / self.gesture_fps) * self.sample_rate)
+        
         window_duration_samples = int((self.window_size / self.gesture_fps) * self.sample_rate)
         
-        self.next_window_start_sample += step_duration_samples
+        self.next_window_start_sample += step_samples
         self.next_window_end_sample = self.next_window_start_sample + window_duration_samples
     
     def add_window(self, window: WaypointWindow):
@@ -737,6 +759,8 @@ class Utterance:
             self.windows.append(window)
             # Add all execution waypoints to the flat list for playback
             self.execution_waypoints.extend(window.execution_waypoints)
+            # Increment counter after successfully adding window
+            self.generated_window_count += 1
     
     def initialize_new_utterance(self, utterance_id: int, start_time: float, 
                                  blend_window: Optional[WaypointWindow] = None):
@@ -762,6 +786,8 @@ class Utterance:
                 # Add the blend window to windows and execution waypoints
                 self.windows.append(blend_window)
                 self.execution_waypoints.extend(blend_window.execution_waypoints)
+                # Increment counter for the blend window
+                self.generated_window_count += 1
     
     def clear(self):
         """
@@ -793,6 +819,7 @@ class Utterance:
             self.windows.clear()
             self.execution_waypoints.clear()
             self.last_executed_waypoint_index = -1
+            self.generated_window_count = 0  # Reset window counter
 
 
     def is_active(self) -> bool:
@@ -1094,6 +1121,14 @@ class DiffSHEGRealtimeWrapper:
             is_for_execution=False
         )
         
+        # Load slowdown configuration
+        self.slowdown_rate = self.config.get('co_speech_gestures', {}).get('slowdown_rate', None)
+        if self.slowdown_rate is not None and self.slowdown_rate > 0:
+            self.logger.info(f"Gesture slowdown enabled: {self.slowdown_rate} (gestures will be {1 + self.slowdown_rate:.2f}x duration)")
+        else:
+            self.slowdown_rate = None
+            self.logger.info("Gesture slowdown disabled")
+        
         self.logger.info(f"DiffSHEG parameters: window_size={self.window_size}, overlap={self.overlap_len}, step={self.window_step}, fps={self.gesture_fps}")
 
         # Warm up CUDA context with dummy inference
@@ -1242,7 +1277,8 @@ class DiffSHEGRealtimeWrapper:
         window = WaypointWindow(
             window_index=0,  # Blend window is standalone
             execution_waypoints=execution_waypoints,
-            context_waypoints=context_waypoints
+            context_waypoints=context_waypoints,
+            audio_step_samples=0  # Blend window doesn't advance audio position
         )
         
         return window
@@ -2086,6 +2122,7 @@ class DiffSHEGRealtimeWrapper:
                     gesture_fps,
                     overlap_context,
                     utterance_id,
+                    window_index=self.current_utterance.generated_window_count,  # Pass current window counter
                     audio_context_start_sample=audio_start_sample,  # Pass context start for proper windowing
                     max_valid_frames=max_valid_frames  # Pass max valid frames for tail filtering
                 )
@@ -2111,8 +2148,9 @@ class DiffSHEGRealtimeWrapper:
                     
                     # Update window indices for next generation (only if not tail generation)
                     # For tail generation, this was the last window, so no need to update indices
+                    # Pass the window to use actual audio coverage for bookkeeping
                     prev_window_end = self.current_utterance.next_window_end_sample
-                    self.current_utterance.update_window_indices()
+                    self.current_utterance.update_window_indices(last_window=window)
                     if not is_tail_generation:
                         self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{self.current_utterance.next_window_start_sample}-{self.current_utterance.next_window_end_sample}] (step={self.current_utterance.next_window_start_sample - (prev_window_end - (self.current_utterance.next_window_end_sample - self.current_utterance.next_window_start_sample))} samples)")
                     else:
@@ -2127,6 +2165,7 @@ class DiffSHEGRealtimeWrapper:
         gesture_fps: int,
         overlap_context: Optional[List[np.ndarray]],
         utterance_id: int,
+        window_index: int = 0,
         precomputed_mel: Optional[torch.Tensor] = None,
         precomputed_hubert: Optional[torch.Tensor] = None,
         audio_context_start_sample: int = 0,
@@ -2193,12 +2232,12 @@ class DiffSHEGRealtimeWrapper:
             audio_bytes_truncated = normalize_audio_direct(audio_bytes_truncated)
 
         # ===== SAVE AUDIO WINDOW FOR DEBUGGING (if enabled) =====
-        window_idx = int(round(window_start_sample / sample_rate * gesture_fps)) // self.window_step
+        # Use the generation counter for window index instead of computing from samples
         self._save_audio_window(
             audio_bytes=audio_bytes_truncated,
             sample_rate=sample_rate,
             utterance_id=utterance_id,
-            window_index=window_idx,
+            window_index=window_index,
             window_start_sample=window_start_sample,
             window_end_sample=window_end_sample
         )
@@ -2319,20 +2358,94 @@ class DiffSHEGRealtimeWrapper:
 
         outputs_np = outputs.cpu().numpy()[0]  # [window_size, C] - FULL window output
         
+        # ===== STEP 8.5: Apply slowdown via SLERP interpolation if configured =====
+        # This happens BEFORE creating waypoints so we work with the actual frames
+        # Save original outputs_np for context waypoint creation (they should use unslowed data)
+        outputs_np_original = outputs_np.copy()
+        
+        if self.slowdown_rate is not None and self.slowdown_rate > 0:
+            # Calculate target number of frames after slowdown
+            original_window_frames = outputs_np.shape[0]  # Should be window_size
+            time_scale = 1.0 + self.slowdown_rate
+            original_duration = original_window_frames / gesture_fps
+            target_duration = original_duration * time_scale
+            target_num_frames = int(round(target_duration * gesture_fps))
+            
+            # Ensure we have at least as many frames as original
+            if target_num_frames <= original_window_frames:
+                target_num_frames = original_window_frames + 1
+            
+            self.logger.debug(
+                f"Applying slowdown ({self.slowdown_rate:.2f}) to generated window: "
+                f"{original_window_frames} frames ({original_duration:.3f}s) → "
+                f"{target_num_frames} frames ({target_duration:.3f}s)"
+            )
+            
+            # Build interpolated frames list
+            slowed_frames = []
+            
+            for target_idx in range(target_num_frames):
+                # Calculate which original frame interval this falls into
+                # Map target_idx (0 to target_num_frames-1) to original space (0 to original_window_frames-1)
+                original_pos = target_idx * (original_window_frames - 1) / (target_num_frames - 1)
+                interval_idx = int(np.floor(original_pos))
+                interval_idx = min(interval_idx, original_window_frames - 2)  # Ensure we have interval_idx + 1
+                
+                alpha = original_pos - interval_idx  # Interpolation factor within interval
+                alpha = np.clip(alpha, 0.0, 1.0)
+                
+                if alpha < 0.001:  # Very close to start frame, use it directly
+                    slowed_frames.append(outputs_np_original[interval_idx].copy())
+                elif alpha > 0.999:  # Very close to end frame, use it directly
+                    slowed_frames.append(outputs_np_original[interval_idx + 1].copy())
+                else:
+                    # Perform SLERP interpolation between the two frames
+                    # Generate multiple frames for smooth interpolation based on alpha
+                    num_interp_frames = max(3, int(1.0 / (alpha if alpha > 0.05 else 0.05)))
+                    alpha_frame_idx = int(alpha * (num_interp_frames - 1))
+                    
+                    interpolated_poses = slerp_interpolate_axis_angles(
+                        start_pose=outputs_np_original[interval_idx],
+                        end_pose=outputs_np_original[interval_idx + 1],
+                        joint_mask_indices=self.joint_mask_indices,
+                        num_frames=num_interp_frames,
+                        split_pos=self.split_pos,
+                        axis_angle_mean=self.axis_angle_mean,
+                        axis_angle_std=self.axis_angle_std,
+                        debug=False
+                    )
+                    
+                    slowed_frames.append(interpolated_poses[alpha_frame_idx])
+            
+            # Replace outputs_np with slowed version
+            outputs_np = np.stack(slowed_frames).astype(np.float32)
+            
+            self.logger.debug(
+                f"Slowdown complete: generated {len(slowed_frames)} frames "
+                f"(added {len(slowed_frames) - original_window_frames} interpolated frames)"
+            )
+        
+
         # ===== STEP 9: Create individual waypoints for each frame =====
         execution_waypoints = []
         context_waypoints = []
         
-        # Determine how many execution frames to create based on max_valid_frames
-        num_execution_frames = self.window_step
+        # Determine how many execution frames to create based on max_valid_frames and slowdown
+        # Note: After slowdown, outputs_np may have more frames than window_step
+        actual_generated_frames = outputs_np.shape[0]
+        num_execution_frames = actual_generated_frames - self.overlap_len  # Exclude overlap for context
+        
         if max_valid_frames is not None:
             # For tail generation, only keep frames corresponding to genuine audio for execution
-            num_execution_frames = min(max_valid_frames, self.window_step)
-            if num_execution_frames < self.window_step:
+            # max_valid_frames tells us how many frames have genuine audio (in ORIGINAL space)
+            # The amount of available audio doesn't change with slowdown!
+            num_execution_frames = min(max_valid_frames, num_execution_frames)
+            
+            if num_execution_frames < (actual_generated_frames - self.overlap_len):
                 self.logger.info(
                     f"Utterance {utterance_id} tail generation: "
-                    f"keeping only {num_execution_frames}/{self.window_step} execution waypoints "
-                    f"(frames with genuine audio), saving {self.window_step - num_execution_frames} beyond-utterance frames for natural ending blend"
+                    f"keeping only {num_execution_frames}/{actual_generated_frames - self.overlap_len} execution waypoints "
+                    f"(frames with genuine audio)"
                 )
         
         # Create execution waypoints (first num_execution_frames frames)
@@ -2359,12 +2472,11 @@ class DiffSHEGRealtimeWrapper:
             execution_waypoints.append(waypoint)
         
         # ===== STEP 10: Apply initial SLERP blending for first window after delayed start =====
-        # When delayed_start is used, the first real generation window (window_idx == 1) follows
-        # the blend window (window_idx == 0). Even though we use inpainting with neutral context,
+        # When delayed_start is used, the first real generation window (window_index == 1) follows
+        # the blend window (window_index == 0). Even though we use inpainting with neutral context,
         # the diffusion model doesn't guarantee smooth transitions. Apply SLERP blending to the
         # initial portion of the first window to ensure smooth motion from neutral.
-        window_idx = window_start_frame // self.window_step
-        if window_idx == 1 and self.initial_blend_duration > 0 and execution_waypoints:
+        if window_index == 1 and self.initial_blend_duration > 0 and execution_waypoints:
             # Calculate how many frames to blend based on initial_blend_duration
             num_blend_frames = int(self.initial_blend_duration * gesture_fps)
             num_blend_frames = min(num_blend_frames, len(execution_waypoints))  # Don't exceed available frames
@@ -2402,6 +2514,7 @@ class DiffSHEGRealtimeWrapper:
 
         # ===== STEP 11: manage context way points for inpainting =====
         # Create context waypoints (last overlap_len frames) - only if not tail generation
+        # IMPORTANT: Context waypoints use ORIGINAL (unslowed) outputs for proper inpainting
         # For tail generation with filtered frames, we don't create context waypoints since there's no next window to use them
         if self.overlap_len > 0 and max_valid_frames is None:
             for i in range(self.overlap_len):
@@ -2411,7 +2524,7 @@ class DiffSHEGRealtimeWrapper:
                 waypoint = GestureWaypoint(
                     waypoint_index=frame_index,
                     timestamp=timestamp,
-                    gesture_data=outputs_np[self.window_step + i],  # [C,] - single frame
+                    gesture_data=outputs_np_original[self.window_step + i],  # [C,] - Use ORIGINAL unslowed frame
                     is_for_execution=False  # Context only, not for execution
                 )
                 
@@ -2426,12 +2539,27 @@ class DiffSHEGRealtimeWrapper:
                 
                 context_waypoints.append(waypoint)
         
+        # Calculate audio step for next window
+        # If slowdown is enabled, we need more audio samples because gestures take longer to execute
+        # Example: 30 frames at 15fps normally takes 2.0s, covering 32000 samples at 16kHz
+        #          With 0.3 slowdown, 39 frames still cover 2.6s of audio (because we interpolated),
+        #          so we need 41600 samples (2.6s * 16000) before starting next window
+        if self.slowdown_rate is not None and self.slowdown_rate > 0:
+            # Extended duration based on slowed-down execution frames
+            time_scale = 1.0 + self.slowdown_rate
+            audio_step_duration = (num_execution_frames / gesture_fps)  # Duration of execution frames
+            audio_step_samples = int(audio_step_duration * sample_rate)
+        else:
+            # Default: advance by window_step frames worth of samples
+            audio_step_samples = int((self.window_step / gesture_fps) * sample_rate)
+        
         # Create window containing all waypoints
-        window_idx = window_start_frame // self.window_step
+        # Use the generation counter for window index (no longer computing from frame positions)
         window = WaypointWindow(
-            window_index=window_idx,
+            window_index=window_index,
             execution_waypoints=execution_waypoints,
-            context_waypoints=context_waypoints
+            context_waypoints=context_waypoints,
+            audio_step_samples=audio_step_samples
         )
         
         return window
