@@ -2517,7 +2517,9 @@ class DiffSHEGRealtimeWrapper:
                 self.logger.debug(
                     f"Utterance {utterance_id} window 1: Initial blend applied successfully"
                 )
-        
+
+
+        # ===== STEP 11: Keep track of beyond-utterance waypoints =====
         # In tail generation situation, create beyond-utterance waypoints (frames beyond max_valid_frames) for natural ending blend
         if max_valid_frames is not None and num_execution_frames < self.window_step:
             for i in range(num_execution_frames, self.window_step):
@@ -2540,7 +2542,9 @@ class DiffSHEGRealtimeWrapper:
                     )
                 
                 beyond_utterance_waypoints.append(waypoint)
-        
+
+
+        # ===== STEP 12: manage context way points for inpainting =====
         # Create context waypoints (last overlap_len frames) - only if not tail generation
         # For tail generation with filtered frames, we don't create context waypoints since there's no next window to use them
         if self.overlap_len > 0 and max_valid_frames is None:
