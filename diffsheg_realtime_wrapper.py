@@ -903,6 +903,11 @@ class DiffSHEGRealtimeWrapper:
 
     # Global flag for using pre-loaded test data for debugging
     USE_TEST_DATA_FOR_WINDOW = False
+    
+    # Global flag for emphasis-only generation mode
+    # When True, only generate gestures for windows overlapping emphasis timestamps
+    # Non-emphasized windows blend to neutral instead
+    EMPHASIS_ONLY = False
 
     
     def __init__(
@@ -1026,6 +1031,7 @@ class DiffSHEGRealtimeWrapper:
         
         self.logger.info("DiffSHEG Realtime Wrapper initialized")
         self.logger.info(f"Configuration: sample_rate={self.audio_sr}, device={self.device}")
+        self.logger.info(f"EMPHASIS_ONLY mode: {'ENABLED' if self.EMPHASIS_ONLY else 'DISABLED'}")
         
         # Setup audio window save directory if SAVE_WINDOWS is enabled
         self.audio_windows_dir = None
@@ -2138,6 +2144,14 @@ class DiffSHEGRealtimeWrapper:
                         if prev_window.context_waypoints:
                             overlap_context = [deepcopy(wp.gesture_data) for wp in prev_window.context_waypoints]
                             self.logger.debug(f"Utterance {utterance_id} using overlap context from previous window {prev_window.window_index}")
+                
+                # Snapshot last execution waypoint for blending
+                # This is either the last execution waypoint from the previous window, or neutral if no windows yet
+                last_execution_waypoint = None
+                if self.current_utterance.windows:
+                    prev_window = self.current_utterance.windows[-1]
+                    if prev_window.execution_waypoints:
+                        last_execution_waypoint = prev_window.execution_waypoints[-1]
             
             # Step 2: Generate gestures without holding the lock
             if should_generate and len(audio_snapshot_full) > 0:
@@ -2159,20 +2173,47 @@ class DiffSHEGRealtimeWrapper:
                         f"tail_audio_samples={tail_audio_samples}, max_valid_frames={max_valid_frames}"
                     )
                 
+                # Snapshot emphasis timestamps if EMPHASIS_ONLY mode is enabled
+                emphasis_timestamps_snapshot = None
+                if self.EMPHASIS_ONLY:
+                    with self.utterance_lock:
+                        if self.current_utterance.utterance_id == utterance_id:
+                            emphasis_timestamps_snapshot = self.current_utterance.emphasis_timestamps.copy()
+                
                 # Generate gestures for this window
                 gen_start_time = time.time()
-                window = self._generate_gesture_window_from_audio(
-                    audio_snapshot_full,  # Pass audio context (or test data if flag enabled)
-                    window_start_sample,
-                    window_end_sample,
-                    sample_rate,
-                    gesture_fps,
-                    overlap_context,
-                    utterance_id,
-                    window_index=self.current_utterance.generated_window_count,  # Pass current window counter
-                    audio_context_start_sample=audio_start_sample,  # Pass context start for proper windowing
-                    max_valid_frames=max_valid_frames  # Pass max valid frames for tail filtering
-                )
+                
+                # Choose generation method based on EMPHASIS_ONLY flag
+                if self.EMPHASIS_ONLY:
+                    window = self._generate_gesture_window_from_audio_emphasis_only(
+                        audio_snapshot_full,  # Pass audio context (or test data if flag enabled)
+                        window_start_sample,
+                        window_end_sample,
+                        sample_rate,
+                        gesture_fps,
+                        overlap_context,
+                        utterance_id,
+                        window_index=self.current_utterance.generated_window_count,  # Pass current window counter
+                        audio_context_start_sample=audio_start_sample,  # Pass context start for proper windowing
+                        max_valid_frames=max_valid_frames,  # Pass max valid frames for tail filtering
+                        emphasis_timestamps=emphasis_timestamps_snapshot,  # Pass emphasis timestamps
+                        last_execution_waypoint=last_execution_waypoint  # Pass last execution waypoint for blending
+                    )
+                else:
+                    window = self._generate_gesture_window_from_audio(
+                        audio_snapshot_full,  # Pass audio context (or test data if flag enabled)
+                        window_start_sample,
+                        window_end_sample,
+                        sample_rate,
+                        gesture_fps,
+                        overlap_context,
+                        utterance_id,
+                        window_index=self.current_utterance.generated_window_count,  # Pass current window counter
+                        audio_context_start_sample=audio_start_sample,  # Pass context start for proper windowing
+                        max_valid_frames=max_valid_frames,  # Pass max valid frames for tail filtering
+                        last_execution_waypoint=last_execution_waypoint  # Pass last execution waypoint for blending
+                    )
+                
                 gen_duration = time.time() - gen_start_time
                 if window:
                     self.logger.debug(f"Utterance {utterance_id} generation completed: window {window.window_index} with {len(window.execution_waypoints)} execution waypoints in {gen_duration:.3f}s")
@@ -2216,7 +2257,8 @@ class DiffSHEGRealtimeWrapper:
         precomputed_mel: Optional[torch.Tensor] = None,
         precomputed_hubert: Optional[torch.Tensor] = None,
         audio_context_start_sample: int = 0,
-        max_valid_frames: Optional[int] = None
+        max_valid_frames: Optional[int] = None,
+        last_execution_waypoint: Optional[GestureWaypoint] = None
     ) -> WaypointWindow:
         """
         Generate gestures for a single window using official DiffSHEG pipeline.
@@ -2518,28 +2560,30 @@ class DiffSHEGRealtimeWrapper:
             
             execution_waypoints.append(waypoint)
         
-        # ===== STEP 10: Apply initial SLERP blending for first window after delayed start =====
-        # When delayed_start is used, the first real generation window (window_index == 1) follows
-        # the blend window (window_index == 0). Even though we use inpainting with neutral context,
-        # the diffusion model doesn't guarantee smooth transitions. Apply SLERP blending to the
-        # initial portion of the first window to ensure smooth motion from neutral.
-        if window_index == 1 and self.initial_blend_duration > 0 and execution_waypoints:
-            # Calculate how many frames to blend based on initial_blend_duration
+        # ===== STEP 10: Apply SLERP blending from last execution waypoint =====
+        # ALWAYS blend from the last executed waypoint to ensure smooth transitions
+        # If no previous waypoint exists, blend from neutral position
+        if execution_waypoints:
+            # Determine starting pose: use last execution waypoint if available, otherwise neutral
+            start_pose = last_execution_waypoint.gesture_data.copy() if last_execution_waypoint is not None else self.neutral_position.copy()
+            
+            # Determine blend duration and number of frames
             num_blend_frames = int(self.initial_blend_duration * gesture_fps)
             num_blend_frames = min(num_blend_frames, len(execution_waypoints))  # Don't exceed available frames
             
             if num_blend_frames > 0:
-                self.logger.info(
-                    f"Utterance {utterance_id} window 1: Applying initial SLERP blend from neutral "
+                blend_source = "last execution waypoint" if last_execution_waypoint is not None else "neutral position"
+                self.logger.debug(
+                    f"Utterance {utterance_id} window {window_index}: Applying SLERP blend from {blend_source} "
                     f"for first {num_blend_frames} frames ({self.initial_blend_duration}s)"
                 )
                 
                 # Get the target pose (last frame to blend to)
                 target_pose = execution_waypoints[num_blend_frames - 1].gesture_data.copy()
                 
-                # Perform SLERP interpolation from neutral to target
+                # Perform SLERP interpolation from start_pose to target
                 blended_poses = slerp_interpolate_axis_angles(
-                    start_pose=self.neutral_position.copy(),
+                    start_pose=start_pose,
                     end_pose=target_pose,
                     joint_mask_indices=self.joint_mask_indices,
                     num_frames=num_blend_frames,
@@ -2554,7 +2598,7 @@ class DiffSHEGRealtimeWrapper:
                     execution_waypoints[i].gesture_data = blended_poses[i]
                 
                 self.logger.debug(
-                    f"Utterance {utterance_id} window 1: Initial blend applied successfully"
+                    f"Utterance {utterance_id} window {window_index}: Blend applied successfully"
                 )
 
 
@@ -2611,4 +2655,190 @@ class DiffSHEGRealtimeWrapper:
         
         return window
 
+    def _generate_gesture_window_from_audio_emphasis_only(
+        self,
+        audio_bytes_truncated: bytes,
+        window_start_sample: int,
+        window_end_sample: int,
+        sample_rate: int,
+        gesture_fps: int,
+        overlap_context: Optional[List[np.ndarray]],
+        utterance_id: int,
+        window_index: int = 0,
+        precomputed_mel: Optional[torch.Tensor] = None,
+        precomputed_hubert: Optional[torch.Tensor] = None,
+        audio_context_start_sample: int = 0,
+        max_valid_frames: Optional[int] = None,
+        emphasis_timestamps: Optional[List[Tuple[float, float]]] = None,
+        last_execution_waypoint: Optional[GestureWaypoint] = None
+    ) -> WaypointWindow:
+        """
+        Generate gestures for a single window with emphasis-only mode.
+        
+        This method checks if the current window overlaps with any emphasis timestamps.
+        - If overlap exists: Generate gestures normally using _generate_gesture_window_from_audio
+        - If no overlap: Create a blend-to-neutral window instead (no model inference)
+        
+        The blend-to-neutral window smoothly transitions from the last generated gesture
+        to the neutral position over the duration of the window, without any slowdown/stretching.
+        
+        Args:
+            (Same as _generate_gesture_window_from_audio, plus:)
+            emphasis_timestamps: List of (start_time, end_time) tuples in seconds relative to utterance start.
+                                If None or empty, treats window as non-emphasized.
+        
+        Returns:
+            WaypointWindow containing either generated gestures or blend-to-neutral waypoints
+        """
+        # Calculate window time range in seconds
+        window_start_time = window_start_sample / sample_rate
+        window_end_time = window_end_sample / sample_rate
+        
+        # Check if this window overlaps with any emphasis timestamp
+        has_emphasis = False
+        if emphasis_timestamps:
+            for emphasis_start, emphasis_end in emphasis_timestamps:
+                # Check for overlap: window overlaps if it's not completely before or after the emphasis
+                if not (window_end_time <= emphasis_start or window_start_time >= emphasis_end):
+                    has_emphasis = True
+                    self.logger.debug(
+                        f"Window [{window_start_time:.3f}s, {window_end_time:.3f}s] overlaps with "
+                        f"emphasis [{emphasis_start:.3f}s, {emphasis_end:.3f}s] - generating gestures"
+                    )
+                    break
+        
+        if has_emphasis:
+            # Window overlaps with emphasis - generate normally
+            self.logger.debug(f"Window has emphasis - using normal generation")
+            return self._generate_gesture_window_from_audio(
+                audio_bytes_truncated=audio_bytes_truncated,
+                window_start_sample=window_start_sample,
+                window_end_sample=window_end_sample,
+                sample_rate=sample_rate,
+                gesture_fps=gesture_fps,
+                overlap_context=overlap_context,
+                utterance_id=utterance_id,
+                window_index=window_index,
+                precomputed_mel=precomputed_mel,
+                precomputed_hubert=precomputed_hubert,
+                audio_context_start_sample=audio_context_start_sample,
+                max_valid_frames=max_valid_frames,
+                last_execution_waypoint=last_execution_waypoint
+            )
+        else:
+            # No emphasis in this window - create blend-to-neutral window
+            self.logger.debug(
+                f"Window [{window_start_time:.3f}s, {window_end_time:.3f}s] has no emphasis - "
+                f"blending to neutral instead of generating"
+            )
+            
+            # Determine the starting gesture for the blend
+            # Blend from the last execution waypoint, or neutral if none available
+            if last_execution_waypoint is not None:
+                start_gesture_data = last_execution_waypoint.gesture_data.copy()
+            else:
+                # No previous execution waypoint - start from neutral
+                start_gesture_data = self.neutral_position.copy()
+            
+            # Calculate window duration and number of frames
+            window_duration = (window_end_sample - window_start_sample) / sample_rate
+            num_frames = int(window_duration * gesture_fps)
+            
+            # Ensure we generate at least window_size frames to maintain consistency
+            if num_frames < self.window_size:
+                num_frames = self.window_size
+            
+            # Create window start frame index
+            window_start_frame = int(round(window_start_sample / sample_rate * gesture_fps))
+            
+            # Use SLERP interpolation to blend to neutral over the window duration
+            # NOTE: No slowdown is applied for emphasis-only blend windows
+            
+            # Perform SLERP interpolation
+            interpolated_poses = slerp_interpolate_axis_angles(
+                start_pose=start_gesture_data,
+                end_pose=self.neutral_position.copy(),
+                joint_mask_indices=self.joint_mask_indices,
+                num_frames=num_frames,
+                split_pos=self.split_pos,
+                axis_angle_mean=self.axis_angle_mean,
+                axis_angle_std=self.axis_angle_std,
+                debug=False
+            )
+            
+            # Create execution waypoints from interpolated poses
+            execution_waypoints = []
+            num_execution_frames = num_frames - self.overlap_len  # Reserve overlap_len for context
+            
+            # Apply max_valid_frames constraint if provided (for tail generation)
+            if max_valid_frames is not None:
+                num_execution_frames = min(max_valid_frames, num_execution_frames)
+            
+            for i in range(num_execution_frames):
+                frame_index = window_start_frame + i
+                timestamp = frame_index / gesture_fps
+                
+                waypoint = GestureWaypoint(
+                    waypoint_index=frame_index,
+                    timestamp=timestamp,
+                    gesture_data=interpolated_poses[i],
+                    is_for_execution=True
+                )
+                
+                # Apply joint mask for consistency
+                if self.joint_mask_indices and len(self.joint_mask_indices) < self.split_pos:
+                    waypoint = apply_joint_mask_to_waypoint(
+                        waypoint,
+                        self.joint_mask_indices,
+                        split_pos=self.split_pos
+                    )
+                
+                execution_waypoints.append(waypoint)
+            
+            # Create context waypoints for next window's inpainting (if not tail generation)
+            context_waypoints = []
+            if self.overlap_len > 0 and max_valid_frames is None:
+                for i in range(self.overlap_len):
+                    frame_index = window_start_frame + num_execution_frames + i
+                    timestamp = frame_index / gesture_fps
+                    
+                    # Use interpolated poses for context (already at or near neutral)
+                    context_idx = num_execution_frames + i
+                    if context_idx < len(interpolated_poses):
+                        context_gesture_data = interpolated_poses[context_idx]
+                    else:
+                        # If we run out of interpolated poses, use neutral
+                        context_gesture_data = self.neutral_position.copy()
+                    
+                    waypoint = GestureWaypoint(
+                        waypoint_index=frame_index,
+                        timestamp=timestamp,
+                        gesture_data=context_gesture_data,
+                        is_for_execution=False
+                    )
+                    
+                    # Apply joint mask
+                    if self.joint_mask_indices and len(self.joint_mask_indices) < self.split_pos:
+                        waypoint = apply_joint_mask_to_waypoint(
+                            waypoint,
+                            self.joint_mask_indices,
+                            split_pos=self.split_pos
+                        )
+                    
+                    context_waypoints.append(waypoint)
+            
+            # Calculate audio step - no slowdown for emphasis-only blend windows
+            audio_step_samples = int((self.window_step / gesture_fps) * sample_rate)
+            
+            # Create and return the blend window
+            window = WaypointWindow(
+                window_index=window_index,
+                execution_waypoints=execution_waypoints,
+                context_waypoints=context_waypoints,
+                audio_step_samples=audio_step_samples
+            )
+            
+            return window
+
+    
     
