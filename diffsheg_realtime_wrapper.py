@@ -907,7 +907,7 @@ class DiffSHEGRealtimeWrapper:
     # Global flag for emphasis-only generation mode
     # When True, only generate gestures for windows overlapping emphasis timestamps
     # Non-emphasized windows blend to neutral instead
-    EMPHASIS_ONLY = False
+    EMPHASIS_ONLY = True
 
     
     def __init__(
