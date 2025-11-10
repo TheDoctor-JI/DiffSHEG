@@ -684,6 +684,9 @@ class Utterance:
                 
         # Utterance duration tracking
         self.total_duration: Optional[float] = None  # Total duration of the utterance in seconds
+        
+        # Emphasis timestamps tracking
+        self.emphasis_timestamps: List[Tuple[float, float]] = []  # List of (start_time, end_time) tuples relative to utterance start
     
     def add_audio_samples(self, audio_data):
         """
@@ -820,6 +823,9 @@ class Utterance:
             self.execution_waypoints.clear()
             self.last_executed_waypoint_index = -1
             self.generated_window_count = 0  # Reset window counter
+            
+            # Clear emphasis timestamps
+            self.emphasis_timestamps.clear()
 
 
     def is_active(self) -> bool:
@@ -1536,6 +1542,11 @@ class DiffSHEGRealtimeWrapper:
             self.blend_start_time = None
             self.blend_last_executed_waypoint_index = -1
 
+
+
+
+
+
     '''
     Utterance lifecycle methods
     '''
@@ -1610,6 +1621,28 @@ class DiffSHEGRealtimeWrapper:
             
             # ## Avoid too frequent logging
             # self.logger.debug(f"Utterance {utterance_id} chunk {chunk_index}: added {audio_samples_after - audio_samples_before} samples (total: {audio_samples_after})")
+    
+    def add_emphasis_timestamp(self, utterance_id: int, start_time: float, end_time: float):
+        """
+        Add an emphasis timestamp to the current utterance.
+        
+        Emphasis timestamps mark portions of the utterance that should receive special
+        emphasis during gesture generation. Start and end times are relative to the
+        start of the utterance.
+        
+        Args:
+            utterance_id: ID of the utterance to add emphasis to
+            start_time: Start time of the emphasis in seconds (relative to utterance start)
+            end_time: End time of the emphasis in seconds (relative to utterance start)
+        """
+        with self.utterance_lock:
+            # Only add if the utterance ID matches the current utterance
+            if self.current_utterance.utterance_id == utterance_id:
+                self.current_utterance.emphasis_timestamps.append((start_time, end_time))
+                self.logger.debug(f"Added emphasis timestamp ({start_time:.3f}s - {end_time:.3f}s) to utterance {utterance_id}")
+            else:
+                # Utterance ID doesn't match - either wrong ID or utterance already ended
+                self.logger.debug(f"Ignoring emphasis timestamp for utterance {utterance_id} (current: {self.current_utterance.utterance_id})")
     
     def stop_current_utterance(self, will_lock: bool):
         """
@@ -1741,6 +1774,10 @@ class DiffSHEGRealtimeWrapper:
                 self.blend_last_executed_waypoint_index = -1
                 self.playback_state = PlaybackState.IDLE
                 self.logger.debug("No blend needed, transitioning directly to IDLE")
+
+
+
+
 
     '''
     Track utterance playback and manage gesture playback
@@ -1883,6 +1920,11 @@ class DiffSHEGRealtimeWrapper:
                 time.sleep(sleep_time)
     
 
+
+
+
+
+
     '''
     Sanity check mode: Non-streaming batch generation
     '''
@@ -1943,6 +1985,11 @@ class DiffSHEGRealtimeWrapper:
         
         return audio_emb, hubert_feat
     
+
+
+
+
+
 
     '''
     Gesture generation scheduling
