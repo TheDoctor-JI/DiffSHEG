@@ -54,6 +54,7 @@ import tempfile
 import os
 from copy import deepcopy
 from PlaybackState import PlaybackState
+import time
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1165,6 +1166,10 @@ class DiffSHEGRealtimeWrapper:
             self.logger.warning(
                 f"Mel frame rate {mel_frame_rate:.3f} does not match gesture FPS {self.gesture_fps}; check configuration."
             )
+
+
+        self.gesture_gen_latency_emulation = self.config.get('co_speech_gestures', {}).get('gesture_gen_latency_emulation', 0.5)
+
 
     def _create_blend_to_neutral_window(self, last_waypoint: GestureWaypoint, blend_duration_sec: float, debug: bool = False) -> WaypointWindow:
         """
@@ -2876,6 +2881,10 @@ class DiffSHEGRealtimeWrapper:
                 audio_step_samples=audio_step_samples
             )
             
+            # Emulate the generation latency before returning
+            time.sleep(self.gesture_gen_latency_emulation)
+
+
             return window
 
     
