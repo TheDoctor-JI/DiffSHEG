@@ -1628,27 +1628,65 @@ class DiffSHEGRealtimeWrapper:
             # ## Avoid too frequent logging
             # self.logger.debug(f"Utterance {utterance_id} chunk {chunk_index}: added {audio_samples_after - audio_samples_before} samples (total: {audio_samples_after})")
     
-    def add_emphasis_timestamp(self, utterance_id: int, start_time: float, end_time: float):
+    def add_emphasis_windows(self, utterance_id: int, windows: List[Tuple[float, float]]):
         """
-        Add an emphasis timestamp to the current utterance.
+        Add emphasis timestamps to the current utterance with overlap merging.
         
         Emphasis timestamps mark portions of the utterance that should receive special
         emphasis during gesture generation. Start and end times are relative to the
         start of the utterance.
         
+        Merging behavior:
+        - Compares each new window against all existing windows
+        - If a new window overlaps with any existing window, the existing window is removed
+        - Only non-overlapping existing windows remain in the list
+        - All new windows are added to the list
+        
         Args:
             utterance_id: ID of the utterance to add emphasis to
-            start_time: Start time of the emphasis in seconds (relative to utterance start)
-            end_time: End time of the emphasis in seconds (relative to utterance start)
+            windows: List of (start_time, end_time) tuples in seconds (relative to utterance start)
         """
         with self.utterance_lock:
             # Only add if the utterance ID matches the current utterance
-            if self.current_utterance.utterance_id == utterance_id:
-                self.current_utterance.emphasis_timestamps.append((start_time, end_time))
-                self.logger.debug(f"Added emphasis timestamp ({start_time:.3f}s - {end_time:.3f}s) to utterance {utterance_id}")
-            else:
+            if self.current_utterance.utterance_id != utterance_id:
                 # Utterance ID doesn't match - either wrong ID or utterance already ended
-                self.logger.debug(f"Ignoring emphasis timestamp for utterance {utterance_id} (current: {self.current_utterance.utterance_id})")
+                self.logger.debug(f"Ignoring emphasis windows for utterance {utterance_id} (current: {self.current_utterance.utterance_id})")
+                return
+            
+            # If no new windows, nothing to do
+            if not windows:
+                self.logger.debug(f"No emphasis windows to add for utterance {utterance_id}")
+                return
+            
+            # Helper function to check if two windows overlap
+            def windows_overlap(win1: Tuple[float, float], win2: Tuple[float, float]) -> bool:
+                """Check if two time windows overlap."""
+                start1, end1 = win1
+                start2, end2 = win2
+                # Windows overlap if one starts before the other ends
+                return not (end1 <= start2 or end2 <= start1)
+            
+            # Create a set to track which existing windows should be removed
+            existing_windows = self.current_utterance.emphasis_timestamps
+            windows_to_remove = set()
+            
+            # Check each new window against all existing windows
+            for new_window in windows:
+                for idx, existing_window in enumerate(existing_windows):
+                    if windows_overlap(new_window, existing_window):
+                        windows_to_remove.add(idx)
+            
+            # Remove overlapping existing windows (in reverse order to preserve indices)
+            for idx in sorted(windows_to_remove, reverse=True):
+                removed_window = existing_windows.pop(idx)
+                self.logger.debug(f"Removed overlapping existing window: ({removed_window[0]:.3f}s - {removed_window[1]:.3f}s)")
+            
+            # Add all new windows
+            for start_time, end_time in windows:
+                existing_windows.append((start_time, end_time))
+                self.logger.debug(f"Added emphasis window ({start_time:.3f}s - {end_time:.3f}s) to utterance {utterance_id}")
+            
+            self.logger.info(f"Updated emphasis windows for utterance {utterance_id}: {len(windows)} new, {len(windows_to_remove)} removed, {len(existing_windows)} total")
     
     def stop_current_utterance(self, will_lock: bool):
         """
