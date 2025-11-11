@@ -688,6 +688,9 @@ class Utterance:
         
         # Emphasis timestamps tracking
         self.emphasis_timestamps: List[Tuple[float, float]] = []  # List of (start_time, end_time) tuples relative to utterance start
+        
+        # Tail generation tracking
+        self.tail_generation_completed: bool = False  # Flag to prevent multiple tail generations
     
     def add_audio_samples(self, audio_data):
         """
@@ -827,6 +830,9 @@ class Utterance:
             
             # Clear emphasis timestamps
             self.emphasis_timestamps.clear()
+            
+            # Reset tail generation flag
+            self.tail_generation_completed = False
 
 
     def is_active(self) -> bool:
@@ -2091,6 +2097,10 @@ class DiffSHEGRealtimeWrapper:
                 if self.current_utterance.utterance_id == Utterance.PLACE_HOLDER_ID:
                     continue
                 
+                # Skip if tail generation already completed for this utterance
+                if self.current_utterance.tail_generation_completed:
+                    continue
+                
                 # Check if we have enough samples for the next window
                 available_samples = self.current_utterance.get_total_samples()
                 
@@ -2321,14 +2331,15 @@ class DiffSHEGRealtimeWrapper:
                     
                     
                     # Update window indices for next generation (only if not tail generation)
-                    # For tail generation, this was the last window, so no need to update indices
                     # Pass the window to use actual audio coverage for bookkeeping
                     prev_window_end = self.current_utterance.next_window_end_sample
                     self.current_utterance.update_window_indices(last_window=window)
                     if not is_tail_generation:
                         self.logger.debug(f"Utterance {utterance_id} window updated: next_window=[{self.current_utterance.next_window_start_sample}-{self.current_utterance.next_window_end_sample}] (step={self.current_utterance.next_window_start_sample - (prev_window_end - (self.current_utterance.next_window_end_sample - self.current_utterance.next_window_start_sample))} samples)")
                     else:
-                        self.logger.debug(f'Tail generation for utterance {utterance_id} completed, no further window updates needed. Window index updated to prevent repeated tail generation.')
+                        # Mark tail generation as completed to prevent repeated generation
+                        self.current_utterance.tail_generation_completed = True
+                        self.logger.debug(f'Tail generation for utterance {utterance_id} completed. Marked to prevent repeated tail generation.')
 
     def _generate_gesture_window_from_audio(
         self, 
