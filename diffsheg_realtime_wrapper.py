@@ -1860,7 +1860,9 @@ class DiffSHEGRealtimeWrapper:
         
         while self.running:
             iteration_start_time = time.time()
-            
+
+            self.logger.debug('Playback loop tick.')
+
             with self.playback_state_lock:
                 current_state = self.playback_state
             
@@ -2070,6 +2072,8 @@ class DiffSHEGRealtimeWrapper:
         """
         while self.running:
             time.sleep(0.05)  # 50ms tick
+
+            self.logger.debug('Generation loop tick.')
             
             # Step 1: Check if we have enough samples for the next window and snapshot everything needed
             should_generate = False
@@ -2100,17 +2104,17 @@ class DiffSHEGRealtimeWrapper:
                     if self.current_utterance.total_duration is None:
                         # Utterance not complete yet, more audio may arrive - keep waiting
                         continue
-                    else:
-                        # Utterance is complete, but has insufficient tail audio
-                        # Generate gestures for the tail with zero-padding
+                    else:# Utterance is complete, but has insufficient tail audio for one complete window
+                        
                         if available_samples <= self.current_utterance.next_window_start_sample:
                             # No new audio samples in this window, skip it
                             continue
                         
+                        # Generate gestures for the tail with zero-padding
                         is_tail_generation = True
                         tail_audio_samples = available_samples - self.current_utterance.next_window_start_sample
-                        self.logger.info(
-                            f"Utterance {self.current_utterance.utterance_id} tail generation: "
+                        self.logger.debug(
+                            f"Utterance {self.current_utterance.utterance_id} next window would be tail generation (if passed through): "
                             f"available_samples={available_samples}, "
                             f"window_start={self.current_utterance.next_window_start_sample}, "
                             f"tail_samples={tail_audio_samples}"
@@ -2137,7 +2141,7 @@ class DiffSHEGRealtimeWrapper:
                             
                             utterance_id_key = self.current_utterance.utterance_id
                             last_log = self._last_timing_log_time.get(utterance_id_key, 0)
-                            if current_time - last_log > 1.0:
+                            if current_time - last_log > 1.0:## Prevent excessive logging of the same constraint
                                 self.logger.debug(
                                     f"Utterance {self.current_utterance.utterance_id} timing constraint not met: "
                                     f"elapsed={elapsed_time:.3f}s, required={required_elapsed_time:.3f}s, "
