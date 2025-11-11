@@ -1076,6 +1076,11 @@ class DiffSHEGRealtimeWrapper:
         # Load delayed start seconds from config
         delayed_start_sec = self.config.get('co_speech_gestures', {}).get('delayed_start_sec', None)
         
+        # Load generation time gap from config
+        # Window K spanning [t0, t1] will only start generation when elapsed time >= t0 - generation_time_gap
+        self.generation_time_gap = self.config.get('co_speech_gestures', {}).get('generation_time_gap', 0.0)
+        self.logger.info(f"Generation time gap: {self.generation_time_gap}s (windows will start generation {self.generation_time_gap}s before their start time)")
+        
         # Load duration timeout threshold from config
         # If elapsed time exceeds prescribed duration by this threshold, stop utterance
         self.duration_timeout_threshold = self.config.get('co_speech_gestures', {}).get('duration_timeout_threshold', 2.0)
@@ -1168,7 +1173,6 @@ class DiffSHEGRealtimeWrapper:
             )
 
 
-        self.gesture_gen_latency_emulation = self.config.get('co_speech_gestures', {}).get('gesture_gen_latency_emulation', 0.5)
 
 
     def _create_blend_to_neutral_window(self, last_waypoint: GestureWaypoint, blend_duration_sec: float, debug: bool = False) -> WaypointWindow:
@@ -1912,8 +1916,6 @@ class DiffSHEGRealtimeWrapper:
                                     #             )
                                     # )
 
-
-
             elif current_state == PlaybackState.BLENDING_TO_NEUTRAL:
                 # Handle blend window playback
                 with self.playback_state_lock:
@@ -2114,7 +2116,44 @@ class DiffSHEGRealtimeWrapper:
                             f"tail_samples={tail_audio_samples}"
                         )
                 
-                # We have enough samples (or this is tail generation), prepare to generate
+                # Check timing constraint: only start generation if elapsed time >= t0 - generation_time_gap
+                if self.generation_time_gap > 0:
+                    # Calculate window start time in seconds relative to utterance start
+                    window_start_time = self.current_utterance.next_window_start_sample / self.current_utterance.sample_rate
+                    
+                    # Calculate current elapsed time since utterance start
+                    if self.current_utterance.start_time != Utterance.PLACE_HOLDER_TIMESTAMP:
+                        current_time = time.time()
+                        elapsed_time = current_time - self.current_utterance.start_time
+                        
+                        # Check if we've reached the generation timing threshold: elapsed >= t0 - gap
+                        required_elapsed_time = window_start_time - self.generation_time_gap
+                        
+                        if elapsed_time < required_elapsed_time:
+                            # Not ready to generate yet - wait until timing constraint is met
+                            # Only log occasionally to avoid spam (every ~1 second)
+                            if not hasattr(self, '_last_timing_log_time'):
+                                self._last_timing_log_time = {}
+                            
+                            utterance_id_key = self.current_utterance.utterance_id
+                            last_log = self._last_timing_log_time.get(utterance_id_key, 0)
+                            if current_time - last_log > 1.0:
+                                self.logger.debug(
+                                    f"Utterance {self.current_utterance.utterance_id} timing constraint not met: "
+                                    f"elapsed={elapsed_time:.3f}s, required={required_elapsed_time:.3f}s, "
+                                    f"window_start={window_start_time:.3f}s, gap={self.generation_time_gap:.3f}s"
+                                )
+                                self._last_timing_log_time[utterance_id_key] = current_time
+                            continue
+                        else:
+                            # Timing constraint met, proceed with generation
+                            self.logger.debug(
+                                f"Utterance {self.current_utterance.utterance_id} timing constraint met: "
+                                f"elapsed={elapsed_time:.3f}s >= required={required_elapsed_time:.3f}s, "
+                                f"proceeding with generation"
+                            )
+                
+                # We have enough samples (or this is tail generation) and timing constraint is met, prepare to generate
                 should_generate = True
                 utterance_id = self.current_utterance.utterance_id
                 window_start_sample = self.current_utterance.next_window_start_sample
@@ -2881,9 +2920,6 @@ class DiffSHEGRealtimeWrapper:
                 audio_step_samples=audio_step_samples
             )
             
-            # Emulate the generation latency before returning
-            time.sleep(self.gesture_gen_latency_emulation)
-
 
             return window
 
