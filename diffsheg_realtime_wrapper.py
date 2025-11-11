@@ -915,6 +915,11 @@ class DiffSHEGRealtimeWrapper:
     # When True, only generate gestures for windows overlapping emphasis timestamps
     # Non-emphasized windows blend to neutral instead
     EMPHASIS_ONLY = True
+    
+    # Global flag for parsimonious emphasis window management
+    # When True, new emphasis windows REPLACE all existing windows instead of merging
+    # This prevents accumulation of emphasis windows and makes gestures more sparse
+    PARSIMONIOUS_WINDOWS = True
 
     
     def __init__(
@@ -1645,17 +1650,24 @@ class DiffSHEGRealtimeWrapper:
     
     def add_emphasis_windows(self, utterance_id: int, windows: List[Tuple[float, float]]):
         """
-        Add emphasis timestamps to the current utterance with overlap merging.
+        Add emphasis timestamps to the current utterance.
         
         Emphasis timestamps mark portions of the utterance that should receive special
         emphasis during gesture generation. Start and end times are relative to the
         start of the utterance.
         
-        Merging behavior:
+        Behavior depends on PARSIMONIOUS_WINDOWS flag:
+        
+        When PARSIMONIOUS_WINDOWS = False (default merging behavior):
         - Compares each new window against all existing windows
         - If a new window overlaps with any existing window, the existing window is removed
         - Only non-overlapping existing windows remain in the list
         - All new windows are added to the list
+        
+        When PARSIMONIOUS_WINDOWS = True (replacement behavior):
+        - All existing emphasis windows are cleared
+        - Only the new windows are kept
+        - This prevents accumulation and makes gestures more parsimonious
         
         Args:
             utterance_id: ID of the utterance to add emphasis to
@@ -1673,35 +1685,51 @@ class DiffSHEGRealtimeWrapper:
                 self.logger.debug(f"No emphasis windows to add for utterance {utterance_id}")
                 return
             
-            # Helper function to check if two windows overlap
-            def windows_overlap(win1: Tuple[float, float], win2: Tuple[float, float]) -> bool:
-                """Check if two time windows overlap."""
-                start1, end1 = win1
-                start2, end2 = win2
-                # Windows overlap if one starts before the other ends
-                return not (end1 <= start2 or end2 <= start1)
-            
-            # Create a set to track which existing windows should be removed
             existing_windows = self.current_utterance.emphasis_timestamps
-            windows_to_remove = set()
             
-            # Check each new window against all existing windows
-            for new_window in windows:
-                for idx, existing_window in enumerate(existing_windows):
-                    if windows_overlap(new_window, existing_window):
-                        windows_to_remove.add(idx)
-            
-            # Remove overlapping existing windows (in reverse order to preserve indices)
-            for idx in sorted(windows_to_remove, reverse=True):
-                removed_window = existing_windows.pop(idx)
-                self.logger.debug(f"Removed overlapping existing window: ({removed_window[0]:.3f}s - {removed_window[1]:.3f}s)")
-            
-            # Add all new windows
-            for start_time, end_time in windows:
-                existing_windows.append((start_time, end_time))
-                self.logger.debug(f"Added emphasis window ({start_time:.3f}s - {end_time:.3f}s) to utterance {utterance_id}")
-            
-            self.logger.info(f"Updated emphasis windows for utterance {utterance_id}: {len(windows)} new, {len(windows_to_remove)} removed, {len(existing_windows)} total")
+            if self.PARSIMONIOUS_WINDOWS:
+                # PARSIMONIOUS mode: Replace all existing windows with new ones
+                num_removed = len(existing_windows)
+                existing_windows.clear()
+                
+                # Add all new windows
+                for start_time, end_time in windows:
+                    existing_windows.append((start_time, end_time))
+                    self.logger.debug(f"Added emphasis window ({start_time:.3f}s - {end_time:.3f}s) to utterance {utterance_id}")
+                
+                self.logger.info(f"Updated emphasis windows for utterance {utterance_id} (PARSIMONIOUS mode): "
+                               f"{len(windows)} new windows REPLACED {num_removed} existing windows, {len(existing_windows)} total")
+            else:
+                # DEFAULT mode: Merge by removing overlapping existing windows
+                # Helper function to check if two windows overlap
+                def windows_overlap(win1: Tuple[float, float], win2: Tuple[float, float]) -> bool:
+                    """Check if two time windows overlap."""
+                    start1, end1 = win1
+                    start2, end2 = win2
+                    # Windows overlap if one starts before the other ends
+                    return not (end1 <= start2 or end2 <= start1)
+                
+                # Create a set to track which existing windows should be removed
+                windows_to_remove = set()
+                
+                # Check each new window against all existing windows
+                for new_window in windows:
+                    for idx, existing_window in enumerate(existing_windows):
+                        if windows_overlap(new_window, existing_window):
+                            windows_to_remove.add(idx)
+                
+                # Remove overlapping existing windows (in reverse order to preserve indices)
+                for idx in sorted(windows_to_remove, reverse=True):
+                    removed_window = existing_windows.pop(idx)
+                    self.logger.debug(f"Removed overlapping existing window: ({removed_window[0]:.3f}s - {removed_window[1]:.3f}s)")
+                
+                # Add all new windows
+                for start_time, end_time in windows:
+                    existing_windows.append((start_time, end_time))
+                    self.logger.debug(f"Added emphasis window ({start_time:.3f}s - {end_time:.3f}s) to utterance {utterance_id}")
+                
+                self.logger.info(f"Updated emphasis windows for utterance {utterance_id} (MERGE mode): "
+                               f"{len(windows)} new, {len(windows_to_remove)} removed, {len(existing_windows)} total")
     
     def stop_current_utterance(self, will_lock: bool):
         """
