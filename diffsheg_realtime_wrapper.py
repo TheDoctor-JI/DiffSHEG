@@ -513,7 +513,7 @@ def slerp_interpolate_axis_angles(
                 
         except Exception as e:
             # Fallback to linear interpolation if rotation conversion fails
-            print(f"Warning: SLERP conversion failed for joint {joint_name} at idx {joint_start_idx}: {e}")
+            print(f"Warning: SLERP conversion failed for joint {joint_name} at idx {joint_start_idx}: {e}\nFull trace:\n{traceback.format_exc()}")
             for frame_idx in range(num_frames):
                 alpha = (frame_idx + 1) / num_frames
                 interpolated_frames_denorm[frame_idx][joint_start_idx:joint_start_idx + 3] = \
@@ -2341,7 +2341,11 @@ class DiffSHEGRealtimeWrapper:
                 gen_duration = time.time() - gen_start_time
                 if window:
                     self.logger.debug(f"Utterance {utterance_id} generation completed: window {window.window_index} with {len(window.execution_waypoints)} execution waypoints in {gen_duration:.3f}s")
-                
+                else:
+                    self.logger.warning(f"Utterance {utterance_id} generation returned no window, generation must have failed.")
+                    continue
+
+
                 # Step 3: Write window back and update generation state
                 with self.utterance_lock:
                     utterance = self.current_utterance
@@ -2480,6 +2484,10 @@ class DiffSHEGRealtimeWrapper:
                 add_cond = {}
                 if hubert_feat is not None:
                     add_cond["pretrain_aud_feat"] = hubert_feat
+        except Exception as e:
+            self.logger.error(f'Error during audio feature extraction: {type(e).__name__}: {e}')
+            self.logger.error(f'Traceback:\n{traceback.format_exc()}')
+            return None
         finally:
             # Re-enable GC if it was enabled before
             if gc_was_enabled:
@@ -2562,6 +2570,11 @@ class DiffSHEGRealtimeWrapper:
                 outputs = self.model.generate_batch(
                     audio_window, p_id, C, add_cond, inpaint_dict
                 )
+        except Exception as e:
+            self.logger.error(f'Error during gesture generation: {type(e).__name__}: {e}')
+            self.logger.error(f'Traceback:\n{traceback.format_exc()}')
+            return None
+
         finally:
             # Re-enable GC if it was enabled before
             if gc_was_enabled:
