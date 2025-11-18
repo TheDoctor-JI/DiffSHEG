@@ -138,7 +138,6 @@ def normalize_audio_direct(audio_bytes: bytes) -> bytes:
         return audio_bytes
 
 
-##TBD: the program will be much cleaner if we refactor it into a virtual audio track and a gesture track.
 
 @dataclass
 class GestureWaypoint:
