@@ -871,6 +871,12 @@ class Utterance:
             for i in range(search_start, len(self.execution_waypoints)):
                 waypoint = self.execution_waypoints[i]
                 
+                # NOTE: Handling of Late Data (Catch-up)
+                # If generation was slow and we fell behind, 'waypoint.timestamp' might be less than 'current_time'.
+                # In that case, this loop will iterate past those "stale" waypoints without returning them.
+                # This effectively skips frames to catch up to the current wall-clock time, causing a "snap" visual effect.
+                # This prioritizes synchronization over smoothness.
+                
                 # Check if this waypoint falls within the upcoming interval
                 if current_time <= waypoint.timestamp < interval_end:
                     self.last_executed_waypoint_index = i
@@ -1934,6 +1940,12 @@ class DiffSHEGRealtimeWrapper:
                                 current_time=elapsed_time,
                                 interval_duration=interval_duration
                             )
+                            
+                            # NOTE: Handling of Slow Generation / Buffer Underrun
+                            # If generation is slower than real-time, get_waypoint_to_execute_for_interval returns None.
+                            # In this case, we simply do nothing for this tick.
+                            # The robot will hold its last position (effectively "freezing") until new data arrives.
+                            # This is a safe degradation: no crash, just a visual pause.
                             if waypoint is not None:
                                 # # Execute waypoint gesture
                                 self.logger.debug(f"Utterance {self.current_utterance.utterance_id} executing waypoint {waypoint.waypoint_index} at t={elapsed_time:.3f}s (timestamp={waypoint.timestamp:.3f}s)")
