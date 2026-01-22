@@ -6,7 +6,8 @@ lmdb
 termcolor
 librosa
 loguru
-umap
+# umap
+umap-learn
 wandb
 transformers
 pandas
@@ -15,6 +16,6 @@ flask
 flask-socketio
 websockets
 soundfile
-torch
+torch==2.9
 torchaudio
 torchvision
