@@ -1565,7 +1565,14 @@ class DiffSHEGRealtimeWrapper:
         with self.utterance_lock:
             self.current_utterance.clear()
             self.stopped_utterances.clear()
-            self.last_executed_waypoint = None
+            # Reset to a neutral waypoint (not None) to ensure blend transitions work
+            # after session reset - matching the initialization behavior
+            self.last_executed_waypoint = GestureWaypoint(
+                waypoint_index=0,
+                timestamp=0.0,
+                gesture_data=self.neutral_position.copy(),
+                is_for_execution=False
+            )
         
         with self.playback_state_lock:
             self.playback_state = PlaybackState.IDLE
