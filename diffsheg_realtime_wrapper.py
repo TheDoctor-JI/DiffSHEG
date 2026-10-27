@@ -15,7 +15,7 @@ DEBUGGING FEATURES:
 
 SAVE_WINDOWS flag:
 - When enabled, saves each audio window sent to gesture generation as a WAV file
-- Files are saved to: embodiment_manager/logger/logs/audio_windows_<timestamp>/
+- Files are saved to: embodiment_manager/logger/logs/<timestamp>_audio_windows/
 - Filename format: utt<utterance_id>_win<window_index>_samples<start>-<end>.wav
 - Useful for comparing audio content when troubleshooting performance issues
 - To enable:
@@ -58,7 +58,7 @@ import time
 
 # Add parent directory to path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from logger.logger import setup_logger
+from logger.logger import setup_logger, create_log_directory
 import wave
 from copy import deepcopy
 from scipy.spatial.transform import Slerp, Rotation
@@ -1059,8 +1059,7 @@ class DiffSHEGRealtimeWrapper:
                 'logger',
                 'logs'
             )
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            self.audio_windows_dir = os.path.join(log_root, f'audio_windows_{timestamp}')
+            self.audio_windows_dir = create_log_directory('audio_windows', log_root)
             os.makedirs(self.audio_windows_dir, exist_ok=True)
             self.logger.info(f"SAVE_WINDOWS enabled: saving audio windows to {self.audio_windows_dir}")
             self.window_save_counter = 0  # Counter for saved windows
